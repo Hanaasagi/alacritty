@@ -9,7 +9,7 @@ use ahash::RandomState;
 use crossfont::Metrics;
 use glutin::context::{ContextApi, GlContext, PossiblyCurrentContext};
 use glutin::display::{GetGlDisplay, GlDisplay};
-use log::{LevelFilter, debug, info};
+use log::{LevelFilter, debug, info, warn};
 use unicode_width::UnicodeWidthChar;
 
 use alacritty_terminal::index::Point;
@@ -20,11 +20,13 @@ use crate::display::SizeInfo;
 use crate::display::color::Rgb;
 use crate::display::content::RenderableCell;
 use crate::gl;
+use crate::renderer::post_process::PostProcessState;
 use crate::renderer::rects::{RectRenderer, RenderRect};
 use crate::renderer::shader::ShaderError;
 
 pub mod platform;
 pub mod rects;
+mod post_process;
 mod shader;
 mod text;
 
@@ -90,6 +92,7 @@ pub struct Renderer {
     text_renderer: TextRendererProvider,
     rect_renderer: RectRenderer,
     robustness: bool,
+    post_process: Option<PostProcessState>,
 }
 
 /// Wrapper around gl::GetString with error checking and reporting.
@@ -171,7 +174,19 @@ impl Renderer {
             }
         }
 
-        Ok(Self { text_renderer, rect_renderer, robustness })
+        let post_process = if use_glsl3 {
+            match PostProcessState::new() {
+                Ok(pp) => Some(pp),
+                Err(e) => {
+                    warn!("Failed to initialize post-processing: {e}");
+                    None
+                },
+            }
+        } else {
+            None
+        };
+
+        Ok(Self { text_renderer, rect_renderer, robustness, post_process })
     }
 
     pub fn draw_cells<I: Iterator<Item = RenderableCell>>(
@@ -339,9 +354,26 @@ impl Renderer {
         }
     }
 
+    /// Bind the post-process FBO when available so rendering targets an offscreen texture.
+    pub fn bind_post_process_fbo(&self) {
+        if let Some(pp) = &self.post_process {
+            pp.bind_fbo();
+        }
+    }
+
+    /// Run the post-process pass, blitting the offscreen texture to the default framebuffer.
+    pub fn draw_post_process(&self, width: u32, height: u32) {
+        if let Some(pp) = &self.post_process {
+            pp.draw(width, height);
+        }
+    }
+
     /// Resize the renderer.
-    pub fn resize(&self, size_info: &SizeInfo) {
+    pub fn resize(&mut self, size_info: &SizeInfo) {
         self.set_viewport(size_info);
+        if let Some(pp) = &mut self.post_process {
+            pp.resize(size_info.width() as u32, size_info.height() as u32);
+        }
         match &self.text_renderer {
             TextRendererProvider::Gles2(renderer) => renderer.resize(size_info),
             TextRendererProvider::Glsl3(renderer) => renderer.resize(size_info),

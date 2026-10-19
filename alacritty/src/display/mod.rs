@@ -835,6 +835,8 @@ impl Display {
         // Make sure this window's OpenGL context is active.
         self.make_current();
 
+        self.renderer.bind_post_process_fbo();
+
         self.renderer.clear(background_color, config.window_opacity());
         let mut lines = RenderLines::new();
 
@@ -1015,6 +1017,12 @@ impl Display {
             let cursor_point = vi_cursor_point.or(Some(cursor_point));
             self.draw_hyperlink_preview(config, cursor_point, display_offset);
         }
+
+        self.renderer.draw_post_process(
+            self.size_info.width() as u32,
+            self.size_info.height() as u32,
+        );
+        self.renderer.set_viewport(&self.size_info);
 
         // Notify winit that we're about to present.
         self.window.pre_present_notify();
