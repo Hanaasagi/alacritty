@@ -30,6 +30,7 @@ mod post_process;
 mod shader;
 mod text;
 
+pub use post_process::ShaderUniformValues;
 pub use text::{GlyphCache, LoaderApi};
 
 use shader::ShaderVersion;
@@ -362,10 +363,24 @@ impl Renderer {
     }
 
     /// Run the post-process pass, blitting the offscreen texture to the default framebuffer.
-    pub fn draw_post_process(&self, width: u32, height: u32) {
+    pub fn draw_post_process(&self, width: u32, height: u32, uniforms: &ShaderUniformValues) {
         if let Some(pp) = &self.post_process {
-            pp.draw(width, height);
+            pp.draw(width, height, uniforms);
         }
+    }
+
+    /// Load a custom post-process shader from the filesystem.
+    pub fn load_custom_shader(&mut self, path: &std::path::Path) -> Result<(), String> {
+        if let Some(pp) = &mut self.post_process {
+            pp.load_custom_shader(path)
+        } else {
+            Err("Post-processing is not available".to_owned())
+        }
+    }
+
+    /// Whether a custom post-process shader is loaded.
+    pub fn has_custom_shader(&self) -> bool {
+        self.post_process.as_ref().is_some_and(PostProcessState::has_custom_shader)
     }
 
     /// Resize the renderer.
