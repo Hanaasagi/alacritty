@@ -222,6 +222,11 @@ impl PostProcessState {
             gl::BindVertexArray(0);
             gl::BindBuffer(gl::ARRAY_BUFFER, 0);
 
+            // Use GL_TEXTURE1 to avoid disturbing the text renderer's glyph
+            // atlas on GL_TEXTURE0.  The text renderer caches which texture
+            // is bound to unit 0 in `active_tex` and skips re-binding when
+            // the ID matches; touching unit 0 here would silently break text.
+            gl::ActiveTexture(gl::TEXTURE1);
             gl::BindTexture(gl::TEXTURE_2D, color_texture);
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
@@ -243,6 +248,7 @@ impl PostProcessState {
                 zero_pixel.as_ptr() as *const _,
             );
             gl::BindTexture(gl::TEXTURE_2D, 0);
+            gl::ActiveTexture(gl::TEXTURE0);
 
             gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
             gl::FramebufferTexture2D(
@@ -300,6 +306,12 @@ impl PostProcessState {
         self.custom_program = Some(program);
         self.custom_uniforms = Some(uniforms);
         Ok(())
+    }
+
+    /// Remove the loaded custom shader, reverting to the passthrough post-process pass.
+    pub fn clear_custom_shader(&mut self) {
+        self.custom_program = None;
+        self.custom_uniforms = None;
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {

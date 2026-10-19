@@ -6,6 +6,7 @@ use std::fmt::{self, Formatter};
 use std::mem::{self, ManuallyDrop};
 use std::num::NonZeroU32;
 use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use glutin::config::GetGlConfig;
@@ -38,6 +39,7 @@ use alacritty_terminal::vte::ansi::{CursorShape, NamedColor};
 
 use crate::config::UiConfig;
 use crate::config::debug::RendererPreference;
+use crate::config::shader::ShaderAnimation;
 use crate::config::font::Font;
 use crate::config::window::Dimensions;
 #[cfg(not(windows))]
@@ -408,6 +410,16 @@ pub struct Display {
     shader_last_frame_time: Instant,
 
     cursor_tracker: CursorTracker,
+
+    /// Whether a cursor shader animation is in progress (`ShaderAnimation::WhenNeeded`).
+    shader_animating: bool,
+    /// Window focus state for shader uniforms.
+    shader_focused: bool,
+    /// Time of the last focus change for shader uniforms.
+    shader_focus_time: Instant,
+
+    /// Set after GPU context recovery so the next `draw()` reloads custom shaders.
+    needs_shader_reload: bool,
 }
 
 impl Display {
@@ -448,6 +460,15 @@ impl Display {
 
         // Create renderer.
         let mut renderer = Renderer::new(&context, config.debug.renderer)?;
+
+        if !config.shader.custom_shader.is_empty() {
+            if let Some(path) = config.shader.custom_shader.first() {
+                let resolved_path = resolve_shader_path(path, &config.config_paths);
+                if let Err(e) = renderer.load_custom_shader(&resolved_path) {
+                    log::warn!("Custom shader load failed: {e}");
+                }
+            }
+        }
 
         // Load font common glyphs to accelerate rendering.
         debug!("Filling glyph cache with common glyphs");
@@ -555,7 +576,60 @@ impl Display {
             shader_frame_count: 0,
             shader_last_frame_time: shader_now,
             cursor_tracker: CursorTracker::new(),
+            shader_animating: false,
+            shader_focused: true,
+            shader_focus_time: shader_now,
+            needs_shader_reload: false,
         })
+    }
+
+    /// Update shader focus state when the window gains or loses focus.
+    ///
+    /// Returns `true` if the focus state changed.
+    pub fn set_shader_focus(&mut self, focused: bool) -> bool {
+        if self.shader_focused != focused {
+            self.shader_focused = focused;
+            self.shader_focus_time = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Redraw and reschedule shader animation after a focus change.
+    ///
+    /// Returns `true` if a redraw is needed to refresh shader uniforms.
+    pub fn handle_shader_focus_change(&mut self, config: &UiConfig, scheduler: &mut Scheduler) -> bool {
+        if !self.renderer.has_custom_shader() {
+            return false;
+        }
+
+        match config.shader.animation {
+            ShaderAnimation::Always | ShaderAnimation::Focused => self.schedule_shader_redraw(scheduler),
+            ShaderAnimation::Off | ShaderAnimation::WhenNeeded => {},
+        }
+
+        true
+    }
+
+    /// Whether continuous shader animation redraw is needed after the current frame.
+    pub fn shader_animation_wants_redraw(&self, config: &UiConfig) -> bool {
+        if !self.renderer.has_custom_shader() {
+            return false;
+        }
+
+        match config.shader.animation {
+            ShaderAnimation::Off => false,
+            ShaderAnimation::Always => true,
+            ShaderAnimation::Focused => self.shader_focused,
+            ShaderAnimation::WhenNeeded => {
+                if !self.shader_animating {
+                    return false;
+                }
+                Instant::now().duration_since(self.cursor_tracker.change_time()).as_secs_f32()
+                    < 1.0
+            },
+        }
     }
 
     #[inline]
@@ -616,6 +690,10 @@ impl Display {
 
         self.reset_glyph_cache();
         self.damage_tracker.frame().mark_fully_damaged();
+
+        // Custom shaders are lost together with the old GL context; flag a
+        // reload so the next draw() (which has config access) restores them.
+        self.needs_shader_reload = true;
 
         debug!("Recovered window {:?} from gpu reset", self.window.id());
     }
@@ -808,7 +886,7 @@ impl Display {
         let display_offset = content.display_offset();
         let cursor = content.cursor();
 
-        self.cursor_tracker.update(
+        let cursor_changed = self.cursor_tracker.update(
             cursor.point(),
             cursor.shape(),
             cursor.color(),
@@ -816,6 +894,31 @@ impl Display {
             &self.size_info,
             self.shader_start_time,
         );
+
+        if self.renderer.has_custom_shader() {
+            match config.shader.animation {
+                ShaderAnimation::Always => self.schedule_shader_redraw(scheduler),
+                ShaderAnimation::Focused if self.shader_focused => {
+                    self.schedule_shader_redraw(scheduler);
+                },
+                ShaderAnimation::WhenNeeded => {
+                    if cursor_changed {
+                        self.shader_animating = true;
+                    }
+                    if self.shader_animating {
+                        let elapsed = Instant::now()
+                            .duration_since(self.cursor_tracker.change_time())
+                            .as_secs_f32();
+                        if elapsed < 1.0 {
+                            self.schedule_shader_redraw(scheduler);
+                        } else {
+                            self.shader_animating = false;
+                        }
+                    }
+                },
+                ShaderAnimation::Off | ShaderAnimation::Focused => {},
+            }
+        }
 
         let cursor_point = terminal.grid().cursor.point;
         let total_lines = terminal.grid().total_lines();
@@ -859,6 +962,13 @@ impl Display {
 
         // Make sure this window's OpenGL context is active.
         self.make_current();
+
+        // After GPU context recovery the old GL objects (including shaders) are
+        // gone.  Reload them now that we have access to the current config.
+        if self.needs_shader_reload {
+            self.needs_shader_reload = false;
+            self.reload_custom_shaders(config);
+        }
 
         self.renderer.bind_post_process_fbo();
 
@@ -1070,8 +1180,8 @@ impl Display {
             previous_cursor_style: previous.style,
             cursor_visible: i32::from(cursor.shape() != CursorShape::Hidden),
             time_cursor_change,
-            focus: 1,
-            time_focus: 0.0,
+            focus: i32::from(self.shader_focused),
+            time_focus: self.shader_focus_time.duration_since(self.shader_start_time).as_secs_f32(),
             background_color: rgb_to_f32(background_color),
             foreground_color: rgb_to_f32(foreground_color),
             cursor_color_rgb: [current.color[0], current.color[1], current.color[2]],
@@ -1123,6 +1233,44 @@ impl Display {
         self.damage_tracker.debug = config.debug.highlight_damage;
         self.visual_bell.update_config(&config.bell);
         self.colors = List::from(&config.colors);
+        self.reload_custom_shaders(config);
+    }
+
+    fn reload_custom_shaders(&mut self, config: &UiConfig) {
+        if let Some(path) = config.shader.custom_shader.first() {
+            let resolved_path = resolve_shader_path(path, &config.config_paths);
+            match self.renderer.load_custom_shader(&resolved_path) {
+                Ok(()) => log::info!("Custom shader reloaded: {}", resolved_path.display()),
+                Err(e) => log::warn!("Custom shader reload failed: {e}"),
+            }
+        } else {
+            self.renderer.clear_custom_shader();
+        }
+
+        // Restart the shader clock so freshly (re)compiled shaders see iTime/iFrame start
+        // from zero. The cursor/focus timestamps share the same time base and must move
+        // too, otherwise their `duration_since` would underflow.
+        if self.renderer.has_custom_shader() {
+            let now = Instant::now();
+            self.shader_start_time = now;
+            self.shader_last_frame_time = now;
+            self.shader_frame_count = 0;
+            self.shader_focus_time = now;
+            self.cursor_tracker.reset(now);
+        }
+    }
+
+    fn schedule_shader_redraw(&self, scheduler: &mut Scheduler) {
+        let window_id = self.window.id();
+        let timer_id = TimerId::new(Topic::ShaderAnimation, window_id);
+
+        if scheduler.scheduled(timer_id) {
+            return;
+        }
+
+        let event = Event::new(EventType::Frame, window_id);
+        let interval = Duration::from_millis(8);
+        scheduler.schedule(event, interval, false, timer_id);
     }
 
     /// Update the mouse/vi mode cursor hint highlighting.
@@ -1503,6 +1651,26 @@ impl Display {
         }
     }
 
+}
+
+/// Resolve a shader path: expand `~` and resolve relative paths against the config directory.
+fn resolve_shader_path(path: &Path, config_paths: &[PathBuf]) -> PathBuf {
+    let mut resolved = path.to_path_buf();
+
+    if let (Ok(stripped), Some(home_dir)) = (path.strip_prefix("~/"), home::home_dir()) {
+        resolved = home_dir.join(stripped);
+    } else if path.is_relative() {
+        if let Some(config_path) = config_paths.first() {
+            if let Some(parent) = config_path.parent() {
+                resolved = parent.join(path);
+            }
+        }
+    }
+
+    resolved
+}
+
+impl Display {
     /// Request a new frame for a window on Wayland.
     fn request_frame(&mut self, scheduler: &mut Scheduler) {
         // Mark that we've used a frame.
