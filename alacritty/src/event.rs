@@ -443,7 +443,9 @@ impl ApplicationHandler<Event> for Processor {
             (EventType::Frame, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.display.window.has_frame = true;
-                    if window_context.dirty {
+                    if window_context.dirty
+                        || window_context.display.shader_animation_wants_redraw(window_context.config())
+                    {
                         window_context.display.window.request_redraw();
                     }
                 }
@@ -1984,6 +1986,14 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     WindowEvent::Touch(touch) => self.touch(touch),
                     WindowEvent::Focused(is_focused) => {
                         self.ctx.terminal.is_focused = is_focused;
+                        if self.ctx.display.set_shader_focus(is_focused) {
+                            if self.ctx.display.handle_shader_focus_change(
+                                self.ctx.config,
+                                self.ctx.scheduler,
+                            ) {
+                                *self.ctx.dirty = true;
+                            }
+                        }
 
                         // When the unfocused hollow is used we must redraw on focus change.
                         if self.ctx.config.cursor.unfocused_hollow {

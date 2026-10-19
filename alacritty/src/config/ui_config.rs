@@ -32,6 +32,7 @@ use crate::config::general::General;
 use crate::config::mouse::Mouse;
 use crate::config::scrolling::Scrolling;
 use crate::config::selection::Selection;
+use crate::config::shader::ShaderConfig;
 use crate::config::terminal::Terminal;
 use crate::config::window::WindowConfig;
 
@@ -68,6 +69,9 @@ pub struct UiConfig {
 
     /// Debug options.
     pub debug: Debug,
+
+    /// Custom shader configuration.
+    pub shader: ShaderConfig,
 
     /// Bell configuration.
     pub bell: BellConfig,

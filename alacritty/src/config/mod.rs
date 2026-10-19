@@ -19,6 +19,7 @@ pub mod general;
 pub mod monitor;
 pub mod scrolling;
 pub mod selection;
+pub mod shader;
 pub mod serde_utils;
 pub mod terminal;
 pub mod ui_config;

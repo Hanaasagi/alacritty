@@ -395,6 +395,15 @@ impl WindowContext {
             &self.config,
             &mut self.search_state,
         );
+
+        // Request re-draw while custom shader animation is active.
+        if self.display.shader_animation_wants_redraw(&self.config) {
+            if self.display.window.has_frame {
+                self.display.window.request_redraw();
+            } else {
+                self.dirty = true;
+            }
+        }
     }
 
     /// Process events for this terminal window.

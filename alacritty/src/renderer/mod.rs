@@ -387,6 +387,13 @@ impl Renderer {
         self.post_process.as_ref().is_some_and(PostProcessState::has_custom_shader)
     }
 
+    /// Clear the loaded custom post-process shader.
+    pub fn clear_custom_shader(&mut self) {
+        if let Some(pp) = &mut self.post_process {
+            pp.clear_custom_shader();
+        }
+    }
+
     /// Resize the renderer.
     pub fn resize(&mut self, size_info: &SizeInfo) {
         self.set_viewport(size_info);

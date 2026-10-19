@@ -135,6 +135,11 @@ impl CursorTracker {
         }
     }
 
+    /// Reset the change timestamp, e.g. when the shader clock restarts.
+    pub fn reset(&mut self, now: Instant) {
+        self.change_time = now;
+    }
+
     pub fn current(&self) -> &CursorSnapshot {
         &self.current
     }
