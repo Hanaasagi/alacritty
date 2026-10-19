@@ -196,6 +196,18 @@ impl<'a> TextRenderer<'a> for Glsl3Renderer {
     }
 }
 
+impl Glsl3Renderer {
+    /// Force the next `render_batch` to re-bind the atlas texture.
+    ///
+    /// The text renderer caches which texture is bound to GL_TEXTURE0 in
+    /// `active_tex` and skips `glBindTexture` when the ID matches.  External
+    /// code that touches GL_TEXTURE0 (e.g. post-process, resize) must call
+    /// this so the atlas is re-bound on the next frame.
+    pub fn invalidate_texture_cache(&mut self) {
+        self.active_tex = 0;
+    }
+}
+
 impl Drop for Glsl3Renderer {
     fn drop(&mut self) {
         unsafe {

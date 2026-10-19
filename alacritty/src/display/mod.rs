@@ -46,6 +46,7 @@ use crate::display::bell::VisualBell;
 use crate::display::color::{List, Rgb};
 use crate::display::content::{RenderableContent, RenderableCursor};
 use crate::display::cursor::IntoRects;
+use crate::display::cursor_state::CursorTracker;
 use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
 use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
@@ -60,6 +61,7 @@ use crate::string::{ShortenDirection, StrShortener};
 pub mod color;
 pub mod content;
 pub mod cursor;
+pub mod cursor_state;
 pub mod hint;
 pub mod window;
 
@@ -404,6 +406,8 @@ pub struct Display {
     shader_frame_count: i32,
     /// Timestamp of the previous frame for delta time.
     shader_last_frame_time: Instant,
+
+    cursor_tracker: CursorTracker,
 }
 
 impl Display {
@@ -550,6 +554,7 @@ impl Display {
             shader_start_time: shader_now,
             shader_frame_count: 0,
             shader_last_frame_time: shader_now,
+            cursor_tracker: CursorTracker::new(),
         })
     }
 
@@ -803,6 +808,15 @@ impl Display {
         let display_offset = content.display_offset();
         let cursor = content.cursor();
 
+        self.cursor_tracker.update(
+            cursor.point(),
+            cursor.shape(),
+            cursor.color(),
+            cursor.width().get(),
+            &self.size_info,
+            self.shader_start_time,
+        );
+
         let cursor_point = terminal.grid().cursor.point;
         let total_lines = terminal.grid().total_lines();
         let metrics = self.glyph_cache.font_metrics();
@@ -1035,12 +1049,36 @@ impl Display {
         self.shader_last_frame_time = now;
         self.shader_frame_count += 1;
 
+        let current = self.cursor_tracker.current();
+        let previous = self.cursor_tracker.previous();
+        let time_cursor_change =
+            self.cursor_tracker.change_time().duration_since(self.shader_start_time).as_secs_f32();
+        let frame_rate = if time_delta > 0.0 { 1.0 / time_delta } else { 60.0 };
+
         let uniform_values = ShaderUniformValues {
             resolution: [self.size_info.width(), self.size_info.height(), 1.0],
             time,
             time_delta,
             frame: self.shader_frame_count,
+            frame_rate,
             mouse: [0.0; 4],
+            current_cursor: [current.x, current.y, current.width, current.height],
+            previous_cursor: [previous.x, previous.y, previous.width, previous.height],
+            current_cursor_color: current.color,
+            previous_cursor_color: previous.color,
+            current_cursor_style: current.style,
+            previous_cursor_style: previous.style,
+            cursor_visible: i32::from(cursor.shape() != CursorShape::Hidden),
+            time_cursor_change,
+            focus: 1,
+            time_focus: 0.0,
+            background_color: rgb_to_f32(background_color),
+            foreground_color: rgb_to_f32(foreground_color),
+            cursor_color_rgb: [current.color[0], current.color[1], current.color[2]],
+            cursor_text: [0.0, 0.0, 0.0],
+            selection_fg_color: [1.0, 1.0, 1.0],
+            selection_bg_color: [0.3, 0.3, 0.8],
+            sample_rate: 0.0,
         };
 
         self.renderer.draw_post_process(
@@ -1639,6 +1677,10 @@ impl FrameTimer {
 ///
 /// This will return a tuple of the cell width and height.
 #[inline]
+fn rgb_to_f32(color: Rgb) -> [f32; 3] {
+    [f32::from(color.r) / 255.0, f32::from(color.g) / 255.0, f32::from(color.b) / 255.0]
+}
+
 fn compute_cell_size(config: &UiConfig, metrics: &crossfont::Metrics) -> (f32, f32) {
     let offset_x = f64::from(config.font.offset.x);
     let offset_y = f64::from(config.font.offset.y);
