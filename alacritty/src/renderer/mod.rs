@@ -363,10 +363,14 @@ impl Renderer {
     }
 
     /// Run the post-process pass, blitting the offscreen texture to the default framebuffer.
-    pub fn draw_post_process(&self, width: u32, height: u32, uniforms: &ShaderUniformValues) {
+    pub fn draw_post_process(&mut self, width: u32, height: u32, uniforms: &ShaderUniformValues) {
         if let Some(pp) = &self.post_process {
             pp.draw(width, height, uniforms);
         }
+        // The post-process pass may change texture bindings on unit 0 (e.g.
+        // during context restore or driver quirks).  Invalidate the text
+        // renderer's cached binding so the glyph atlas is always re-bound.
+        self.invalidate_text_texture_cache();
     }
 
     /// Load a custom post-process shader from the filesystem.
@@ -392,6 +396,18 @@ impl Renderer {
         match &self.text_renderer {
             TextRendererProvider::Gles2(renderer) => renderer.resize(size_info),
             TextRendererProvider::Glsl3(renderer) => renderer.resize(size_info),
+        }
+        // Resize may have disturbed texture unit 0 (post_process binds FBO
+        // texture for reallocation).  Ensure the text renderer re-binds its
+        // glyph atlas on the next frame.
+        self.invalidate_text_texture_cache();
+    }
+
+    /// Force the text renderer to re-bind its glyph atlas texture.
+    fn invalidate_text_texture_cache(&mut self) {
+        match &mut self.text_renderer {
+            TextRendererProvider::Glsl3(renderer) => renderer.invalidate_texture_cache(),
+            TextRendererProvider::Gles2(_) => {},
         }
     }
 }

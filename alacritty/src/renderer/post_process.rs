@@ -16,7 +16,25 @@ pub struct ShaderUniformValues {
     pub time: f32,
     pub time_delta: f32,
     pub frame: i32,
+    pub frame_rate: f32,
     pub mouse: [f32; 4],
+    pub current_cursor: [f32; 4],
+    pub previous_cursor: [f32; 4],
+    pub current_cursor_color: [f32; 4],
+    pub previous_cursor_color: [f32; 4],
+    pub current_cursor_style: i32,
+    pub previous_cursor_style: i32,
+    pub cursor_visible: i32,
+    pub time_cursor_change: f32,
+    pub focus: i32,
+    pub time_focus: f32,
+    pub background_color: [f32; 3],
+    pub foreground_color: [f32; 3],
+    pub cursor_color_rgb: [f32; 3],
+    pub cursor_text: [f32; 3],
+    pub selection_fg_color: [f32; 3],
+    pub selection_bg_color: [f32; 3],
+    pub sample_rate: f32,
 }
 
 #[derive(Debug)]
@@ -84,28 +102,25 @@ impl CustomShaderUniforms {
         Self::set_1f(self.i_time, v.time);
         Self::set_1f(self.i_time_delta, v.time_delta);
         Self::set_1i(self.i_frame, v.frame);
+        Self::set_1f(self.i_frame_rate, v.frame_rate);
         Self::set_4f(self.i_mouse, &v.mouse);
-
-        let zero4 = [0.0; 4];
-        let zero3 = [0.0; 3];
-        Self::set_4f(self.i_current_cursor, &zero4);
-        Self::set_4f(self.i_previous_cursor, &zero4);
-        Self::set_4f(self.i_current_cursor_color, &zero4);
-        Self::set_4f(self.i_previous_cursor_color, &zero4);
-        Self::set_1i(self.i_current_cursor_style, 0);
-        Self::set_1i(self.i_previous_cursor_style, 0);
-        Self::set_1i(self.i_cursor_visible, 0);
-        Self::set_1f(self.i_time_cursor_change, 0.0);
-        Self::set_1f(self.i_time_focus, 0.0);
-        Self::set_1i(self.i_focus, 0);
-        Self::set_3f(self.i_background_color, &zero3);
-        Self::set_3f(self.i_foreground_color, &zero3);
-        Self::set_3f(self.i_cursor_color, &zero3);
-        Self::set_3f(self.i_cursor_text, &zero3);
-        Self::set_3f(self.i_selection_foreground_color, &zero3);
-        Self::set_3f(self.i_selection_background_color, &zero3);
-        Self::set_1f(self.i_frame_rate, 0.0);
-        Self::set_1f(self.i_sample_rate, 0.0);
+        Self::set_4f(self.i_current_cursor, &v.current_cursor);
+        Self::set_4f(self.i_previous_cursor, &v.previous_cursor);
+        Self::set_4f(self.i_current_cursor_color, &v.current_cursor_color);
+        Self::set_4f(self.i_previous_cursor_color, &v.previous_cursor_color);
+        Self::set_1i(self.i_current_cursor_style, v.current_cursor_style);
+        Self::set_1i(self.i_previous_cursor_style, v.previous_cursor_style);
+        Self::set_1i(self.i_cursor_visible, v.cursor_visible);
+        Self::set_1f(self.i_time_cursor_change, v.time_cursor_change);
+        Self::set_1f(self.i_time_focus, v.time_focus);
+        Self::set_1i(self.i_focus, v.focus);
+        Self::set_3f(self.i_background_color, &v.background_color);
+        Self::set_3f(self.i_foreground_color, &v.foreground_color);
+        Self::set_3f(self.i_cursor_color, &v.cursor_color_rgb);
+        Self::set_3f(self.i_cursor_text, &v.cursor_text);
+        Self::set_3f(self.i_selection_foreground_color, &v.selection_fg_color);
+        Self::set_3f(self.i_selection_background_color, &v.selection_bg_color);
+        Self::set_1f(self.i_sample_rate, v.sample_rate);
         Self::set_4f(self.i_date, &[0.0; 4]);
     }
 
@@ -296,14 +311,21 @@ impl PostProcessState {
         self.width = width;
         self.height = height;
         unsafe {
-            // Resize the FBO render target.
+            // Use GL_TEXTURE1 to avoid disturbing the text renderer's glyph
+            // atlas on GL_TEXTURE0.  The text renderer caches which texture
+            // is bound to unit 0 in `active_tex` and skips re-binding when
+            // the ID matches; touching unit 0 here would silently break text.
+            gl::ActiveTexture(gl::TEXTURE1);
             gl::BindTexture(gl::TEXTURE_2D, self.color_texture);
             gl::TexImage2D(
                 gl::TEXTURE_2D, 0, gl::RGBA8 as i32,
                 width as i32, height as i32, 0,
                 gl::RGBA, gl::UNSIGNED_BYTE, std::ptr::null(),
             );
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_BASE_LEVEL, 0);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAX_LEVEL, 0);
             gl::BindTexture(gl::TEXTURE_2D, 0);
+            gl::ActiveTexture(gl::TEXTURE0);
 
             // Re-attach the color texture to the FBO.
             gl::BindFramebuffer(gl::FRAMEBUFFER, self.fbo);
