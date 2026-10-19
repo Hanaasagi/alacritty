@@ -53,7 +53,7 @@ use crate::display::window::Window;
 use crate::event::{Event, EventType, Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
 use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
-use crate::renderer::{self, GlyphCache, Renderer, platform};
+use crate::renderer::{self, GlyphCache, Renderer, ShaderUniformValues, platform};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::string::{ShortenDirection, StrShortener};
 
@@ -397,6 +397,13 @@ pub struct Display {
 
     glyph_cache: GlyphCache,
     meter: Meter,
+
+    /// Time base for post-process shader uniforms.
+    shader_start_time: Instant,
+    /// Frame counter for post-process shader uniforms.
+    shader_frame_count: i32,
+    /// Timestamp of the previous frame for delta time.
+    shader_last_frame_time: Instant,
 }
 
 impl Display {
@@ -514,6 +521,7 @@ impl Display {
             info!("Failed to disable vsync: {err}");
         }
 
+        let shader_now = Instant::now();
         Ok(Self {
             context: ManuallyDrop::new(context),
             visual_bell: VisualBell::from(&config.bell),
@@ -539,6 +547,9 @@ impl Display {
             cursor_hidden: Default::default(),
             meter: Default::default(),
             ime: Default::default(),
+            shader_start_time: shader_now,
+            shader_frame_count: 0,
+            shader_last_frame_time: shader_now,
         })
     }
 
@@ -1018,9 +1029,24 @@ impl Display {
             self.draw_hyperlink_preview(config, cursor_point, display_offset);
         }
 
+        let now = Instant::now();
+        let time = now.duration_since(self.shader_start_time).as_secs_f32();
+        let time_delta = now.duration_since(self.shader_last_frame_time).as_secs_f32();
+        self.shader_last_frame_time = now;
+        self.shader_frame_count += 1;
+
+        let uniform_values = ShaderUniformValues {
+            resolution: [self.size_info.width(), self.size_info.height(), 1.0],
+            time,
+            time_delta,
+            frame: self.shader_frame_count,
+            mouse: [0.0; 4],
+        };
+
         self.renderer.draw_post_process(
             self.size_info.width() as u32,
             self.size_info.height() as u32,
+            &uniform_values,
         );
         self.renderer.set_viewport(&self.size_info);
 

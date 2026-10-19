@@ -56,6 +56,37 @@ impl ShaderProgram {
         Ok(program)
     }
 
+    /// Create a post-process shader program from runtime sources.
+    ///
+    /// The shader prefix must include `#version`; no automatic version header is prepended.
+    pub fn new_post_process(
+        vertex_shader: &str,
+        shader_prefix: &str,
+        fragment_shader: &str,
+    ) -> Result<Self, ShaderError> {
+        const VERSION: &str = "#version 330 core\n";
+        let vertex_shader =
+            Shader::new_from_parts(gl::VERTEX_SHADER, &[VERSION, vertex_shader])?;
+        let fragment_shader =
+            Shader::new_from_parts(gl::FRAGMENT_SHADER, &[shader_prefix, fragment_shader])?;
+
+        let program = unsafe { Self(gl::CreateProgram()) };
+
+        let mut success: GLint = 0;
+        unsafe {
+            gl::AttachShader(program.id(), vertex_shader.id());
+            gl::AttachShader(program.id(), fragment_shader.id());
+            gl::LinkProgram(program.id());
+            gl::GetProgramiv(program.id(), gl::LINK_STATUS, &mut success);
+        }
+
+        if success != i32::from(gl::TRUE) {
+            return Err(ShaderError::Link(get_program_info_log(program.id())));
+        }
+
+        Ok(program)
+    }
+
     /// Get uniform location by name. Panic if failed.
     pub fn get_uniform_location(&self, name: &'static CStr) -> Result<GLint, ShaderError> {
         // This call doesn't require `UseProgram`.
@@ -83,6 +114,32 @@ impl Drop for ShaderProgram {
 struct Shader(GLuint);
 
 impl Shader {
+    /// Create a shader from multiple source parts without an automatic version header.
+    fn new_from_parts(kind: GLenum, parts: &[&str]) -> Result<Self, ShaderError> {
+        let sources: Vec<*const GLchar> = parts.iter().map(|p| p.as_ptr().cast()).collect();
+        let lengths: Vec<GLint> = parts.iter().map(|p| p.len() as GLint).collect();
+
+        let shader = unsafe { Self(gl::CreateShader(kind)) };
+
+        let mut success: GLint = 0;
+        unsafe {
+            gl::ShaderSource(
+                shader.id(),
+                parts.len() as GLint,
+                sources.as_ptr().cast(),
+                lengths.as_ptr(),
+            );
+            gl::CompileShader(shader.id());
+            gl::GetShaderiv(shader.id(), gl::COMPILE_STATUS, &mut success);
+        }
+
+        if success == GLint::from(gl::TRUE) {
+            Ok(shader)
+        } else {
+            Err(ShaderError::Compile(get_shader_info_log(shader.id())))
+        }
+    }
+
     fn new(
         shader_version: ShaderVersion,
         shader_header: Option<&str>,
