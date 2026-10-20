@@ -3,8 +3,8 @@ use std::time::Instant;
 use alacritty_terminal::index::Point;
 use alacritty_terminal::vte::ansi::CursorShape;
 
-use crate::display::color::Rgb;
 use crate::display::SizeInfo;
+use crate::display::color::Rgb;
 
 /// Pixel-level snapshot of cursor position, size, and color.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -25,14 +25,7 @@ pub struct CursorSnapshot {
 
 impl Default for CursorSnapshot {
     fn default() -> Self {
-        Self {
-            x: 0.0,
-            y: 0.0,
-            width: 0.0,
-            height: 0.0,
-            color: [1.0, 1.0, 1.0, 1.0],
-            style: 0,
-        }
+        Self { x: 0.0, y: 0.0, width: 0.0, height: 0.0, color: [1.0, 1.0, 1.0, 1.0], style: 0 }
     }
 }
 
