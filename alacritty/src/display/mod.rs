@@ -465,11 +465,15 @@ impl Display {
         let mut renderer = Renderer::new(&context, config.debug.renderer)?;
 
         if !config.shader.custom_shader.is_empty() {
-            if let Some(path) = config.shader.custom_shader.first() {
-                let resolved_path = resolve_shader_path(path, &config.config_paths);
-                if let Err(e) = renderer.load_custom_shader(&resolved_path) {
-                    log::warn!("Custom shader load failed: {e}");
-                }
+            let paths: Vec<PathBuf> = config
+                .shader
+                .custom_shader
+                .iter()
+                .map(|p| resolve_shader_path(p, &config.config_paths))
+                .collect();
+            let errors = renderer.load_custom_shaders(&paths);
+            for (path, err) in errors {
+                log::warn!("Custom shader load failed for {}: {err}", path.display());
             }
         }
 
@@ -1251,11 +1255,22 @@ impl Display {
     }
 
     fn reload_custom_shaders(&mut self, config: &UiConfig) {
-        if let Some(path) = config.shader.custom_shader.first() {
-            let resolved_path = resolve_shader_path(path, &config.config_paths);
-            match self.renderer.load_custom_shader(&resolved_path) {
-                Ok(()) => log::info!("Custom shader reloaded: {}", resolved_path.display()),
-                Err(e) => log::warn!("Custom shader reload failed: {e}"),
+        if !config.shader.custom_shader.is_empty() {
+            let paths: Vec<PathBuf> = config
+                .shader
+                .custom_shader
+                .iter()
+                .map(|p| resolve_shader_path(p, &config.config_paths))
+                .collect();
+            let errors = self.renderer.load_custom_shaders(&paths);
+            for (path, err) in &errors {
+                log::warn!("Custom shader reload failed for {}: {err}", path.display());
+            }
+            if errors.is_empty() {
+                log::info!(
+                    "Custom shaders reloaded ({} shader(s))",
+                    config.shader.custom_shader.len()
+                );
             }
         } else {
             self.renderer.clear_custom_shader();

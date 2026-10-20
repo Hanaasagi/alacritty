@@ -373,7 +373,23 @@ impl Renderer {
         self.invalidate_text_texture_cache();
     }
 
-    /// Load a custom post-process shader from the filesystem.
+    /// Load multiple custom post-process shaders from the filesystem.
+    pub fn load_custom_shaders(
+        &mut self,
+        paths: &[std::path::PathBuf],
+    ) -> Vec<(std::path::PathBuf, String)> {
+        if let Some(pp) = &mut self.post_process {
+            pp.load_custom_shaders(paths)
+        } else {
+            paths
+                .iter()
+                .map(|p| (p.clone(), "Post-processing is not available".to_owned()))
+                .collect()
+        }
+    }
+
+    /// Load a single custom post-process shader (backward-compatible wrapper).
+    #[allow(dead_code)]
     pub fn load_custom_shader(&mut self, path: &std::path::Path) -> Result<(), String> {
         if let Some(pp) = &mut self.post_process {
             pp.load_custom_shader(path)
