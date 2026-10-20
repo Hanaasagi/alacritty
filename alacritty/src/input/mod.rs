@@ -452,9 +452,10 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
     #[inline]
     pub fn mouse_moved(&mut self, position: PhysicalPosition<f64>) {
-        let size_info = self.ctx.size_info();
-
         let (x, y) = position.into();
+        self.ctx.display().update_mouse_position(x as f32, y as f32);
+
+        let size_info = self.ctx.size_info();
 
         let lmb_pressed = self.ctx.mouse().left_button_state == ElementState::Pressed;
         let rmb_pressed = self.ctx.mouse().right_button_state == ElementState::Pressed;

@@ -418,6 +418,9 @@ pub struct Display {
     /// Time of the last focus change for shader uniforms.
     shader_focus_time: Instant,
 
+    /// Current mouse position in GL coordinates (origin bottom-left, Y up).
+    shader_mouse: [f32; 4],
+
     /// Set after GPU context recovery so the next `draw()` reloads custom shaders.
     needs_shader_reload: bool,
 }
@@ -579,8 +582,15 @@ impl Display {
             shader_animating: false,
             shader_focused: true,
             shader_focus_time: shader_now,
+            shader_mouse: [0.0; 4],
             needs_shader_reload: false,
         })
+    }
+
+    /// Update mouse position for post-process shader uniforms (ShaderToy `iMouse` xy).
+    pub fn update_mouse_position(&mut self, x: f32, y_winit: f32) {
+        self.shader_mouse[0] = x;
+        self.shader_mouse[1] = self.size_info.height() - y_winit;
     }
 
     /// Update shader focus state when the window gains or loses focus.
@@ -1165,13 +1175,14 @@ impl Display {
             self.cursor_tracker.change_time().duration_since(self.shader_start_time).as_secs_f32();
         let frame_rate = if time_delta > 0.0 { 1.0 / time_delta } else { 60.0 };
 
+        let resolution = [self.size_info.width(), self.size_info.height(), 1.0];
         let uniform_values = ShaderUniformValues {
-            resolution: [self.size_info.width(), self.size_info.height(), 1.0],
+            resolution,
             time,
             time_delta,
             frame: self.shader_frame_count,
             frame_rate,
-            mouse: [0.0; 4],
+            mouse: self.shader_mouse,
             current_cursor: [current.x, current.y, current.width, current.height],
             previous_cursor: [previous.x, previous.y, previous.width, previous.height],
             current_cursor_color: current.color,
@@ -1189,6 +1200,9 @@ impl Display {
             selection_fg_color: [1.0, 1.0, 1.0],
             selection_bg_color: [0.3, 0.3, 0.8],
             sample_rate: 0.0,
+            date: [0.0; 4],
+            channel_resolution: [resolution, [0.0; 3], [0.0; 3], [0.0; 3]],
+            channel_time: [0.0; 4],
         };
 
         self.renderer.draw_post_process(
