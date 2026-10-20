@@ -9,6 +9,8 @@ uniform int iFrame;
 uniform vec4 iMouse;
 uniform vec4 iDate;
 uniform float iSampleRate;
+uniform vec3 iChannelResolution[4];
+uniform float iChannelTime[4];
 
 // Ghostty cursor uniforms (cursor-shaders)
 uniform vec4 iCurrentCursor;

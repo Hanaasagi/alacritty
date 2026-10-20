@@ -35,6 +35,9 @@ pub struct ShaderUniformValues {
     pub selection_fg_color: [f32; 3],
     pub selection_bg_color: [f32; 3],
     pub sample_rate: f32,
+    pub date: [f32; 4],
+    pub channel_resolution: [[f32; 3]; 4],
+    pub channel_time: [f32; 4],
 }
 
 #[derive(Debug)]
@@ -64,6 +67,8 @@ pub struct CustomShaderUniforms {
     pub i_selection_background_color: GLint,
     pub i_frame_rate: GLint,
     pub i_sample_rate: GLint,
+    pub i_channel_resolution: GLint,
+    pub i_channel_time: GLint,
 }
 
 impl CustomShaderUniforms {
@@ -94,6 +99,8 @@ impl CustomShaderUniforms {
             i_selection_background_color: uniform_location(program, c"iSelectionBackgroundColor"),
             i_frame_rate: uniform_location(program, c"iFrameRate"),
             i_sample_rate: uniform_location(program, c"iSampleRate"),
+            i_channel_resolution: uniform_location(program, c"iChannelResolution"),
+            i_channel_time: uniform_location(program, c"iChannelTime"),
         }
     }
 
@@ -121,7 +128,9 @@ impl CustomShaderUniforms {
         Self::set_3f(self.i_selection_foreground_color, &v.selection_fg_color);
         Self::set_3f(self.i_selection_background_color, &v.selection_bg_color);
         Self::set_1f(self.i_sample_rate, v.sample_rate);
-        Self::set_4f(self.i_date, &[0.0; 4]);
+        Self::set_4f(self.i_date, &v.date);
+        Self::set_3fv(self.i_channel_resolution, 4, &v.channel_resolution);
+        Self::set_1fv(self.i_channel_time, 4, &v.channel_time);
     }
 
     fn set_1f(loc: GLint, v: f32) {
@@ -152,6 +161,24 @@ impl CustomShaderUniforms {
         if loc >= 0 {
             unsafe {
                 gl::Uniform4f(loc, v[0], v[1], v[2], v[3]);
+            }
+        }
+    }
+
+    fn set_3fv(loc: GLint, count: i32, data: &[[f32; 3]; 4]) {
+        if loc >= 0 {
+            let flat =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, 3 * data.len()) };
+            unsafe {
+                gl::Uniform3fv(loc, count, flat.as_ptr());
+            }
+        }
+    }
+
+    fn set_1fv(loc: GLint, count: i32, data: &[f32; 4]) {
+        if loc >= 0 {
+            unsafe {
+                gl::Uniform1fv(loc, count, data.as_ptr());
             }
         }
     }
