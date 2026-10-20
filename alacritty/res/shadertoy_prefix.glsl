@@ -31,6 +31,7 @@ uniform vec3 iCursorColor;
 uniform vec3 iCursorText;
 uniform vec3 iSelectionForegroundColor;
 uniform vec3 iSelectionBackgroundColor;
+uniform vec3 iPalette[256];
 
 uniform sampler2D iChannel0;
 

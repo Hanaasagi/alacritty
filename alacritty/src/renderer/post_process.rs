@@ -38,6 +38,7 @@ pub struct ShaderUniformValues {
     pub date: [f32; 4],
     pub channel_resolution: [[f32; 3]; 4],
     pub channel_time: [f32; 4],
+    pub palette: [[f32; 3]; 256],
 }
 
 #[derive(Debug)]
@@ -69,6 +70,7 @@ pub struct CustomShaderUniforms {
     pub i_sample_rate: GLint,
     pub i_channel_resolution: GLint,
     pub i_channel_time: GLint,
+    pub i_palette: GLint,
 }
 
 impl CustomShaderUniforms {
@@ -101,6 +103,7 @@ impl CustomShaderUniforms {
             i_sample_rate: uniform_location(program, c"iSampleRate"),
             i_channel_resolution: uniform_location(program, c"iChannelResolution"),
             i_channel_time: uniform_location(program, c"iChannelTime"),
+            i_palette: uniform_location(program, c"iPalette"),
         }
     }
 
@@ -129,8 +132,9 @@ impl CustomShaderUniforms {
         Self::set_3f(self.i_selection_background_color, &v.selection_bg_color);
         Self::set_1f(self.i_sample_rate, v.sample_rate);
         Self::set_4f(self.i_date, &v.date);
-        Self::set_3fv(self.i_channel_resolution, 4, &v.channel_resolution);
+        Self::set_3fv(self.i_channel_resolution, &v.channel_resolution);
         Self::set_1fv(self.i_channel_time, 4, &v.channel_time);
+        Self::set_3fv(self.i_palette, &v.palette);
     }
 
     fn set_1f(loc: GLint, v: f32) {
@@ -165,12 +169,12 @@ impl CustomShaderUniforms {
         }
     }
 
-    fn set_3fv(loc: GLint, count: i32, data: &[[f32; 3]; 4]) {
+    fn set_3fv(loc: GLint, data: &[[f32; 3]]) {
         if loc >= 0 {
             let flat =
                 unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, 3 * data.len()) };
             unsafe {
-                gl::Uniform3fv(loc, count, flat.as_ptr());
+                gl::Uniform3fv(loc, data.len() as i32, flat.as_ptr());
             }
         }
     }

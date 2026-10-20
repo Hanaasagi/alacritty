@@ -897,6 +897,12 @@ impl Display {
         let selection_range = content.selection_range();
         let foreground_color = content.color(NamedColor::Foreground as usize);
         let background_color = content.color(NamedColor::Background as usize);
+
+        let mut palette = [[0.0f32; 3]; 256];
+        for i in 0..256 {
+            palette[i] = rgb_to_f32(content.color(i));
+        }
+
         let display_offset = content.display_offset();
         let cursor = content.cursor();
 
@@ -1180,6 +1186,7 @@ impl Display {
         let frame_rate = if time_delta > 0.0 { 1.0 / time_delta } else { 60.0 };
 
         let resolution = [self.size_info.width(), self.size_info.height(), 1.0];
+
         let uniform_values = ShaderUniformValues {
             resolution,
             time,
@@ -1207,6 +1214,7 @@ impl Display {
             date: [0.0; 4],
             channel_resolution: [resolution, [0.0; 3], [0.0; 3], [0.0; 3]],
             channel_time: [0.0; 4],
+            palette,
         };
 
         self.renderer.draw_post_process(
