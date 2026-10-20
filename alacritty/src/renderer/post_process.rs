@@ -1,5 +1,5 @@
 use std::ffi::CStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::gl;
 use crate::gl::types::*;
@@ -198,8 +198,9 @@ pub struct PostProcessState {
     vbo: GLuint,
     passthrough_program: ShaderProgram,
     u_screen_texture: GLint,
-    custom_program: Option<ShaderProgram>,
-    custom_uniforms: Option<CustomShaderUniforms>,
+    ping_texture: GLuint,
+    ping_fbo: GLuint,
+    custom_shaders: Vec<(ShaderProgram, CustomShaderUniforms)>,
 }
 
 impl PostProcessState {
@@ -214,6 +215,8 @@ impl PostProcessState {
 
         let mut fbo: GLuint = 0;
         let mut color_texture: GLuint = 0;
+        let mut ping_texture: GLuint = 0;
+        let mut ping_fbo: GLuint = 0;
         let mut vao: GLuint = 0;
         let mut vbo: GLuint = 0;
 
@@ -296,6 +299,53 @@ impl PostProcessState {
                 gl::DeleteVertexArrays(1, &vao);
                 return Err(format!("Framebuffer is not complete: {status}").into());
             }
+
+            gl::GenTextures(1, &mut ping_texture);
+            gl::GenFramebuffers(1, &mut ping_fbo);
+
+            gl::ActiveTexture(gl::TEXTURE1);
+            gl::BindTexture(gl::TEXTURE_2D, ping_texture);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_BASE_LEVEL, 0);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAX_LEVEL, 0);
+            gl::TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::RGBA8 as i32,
+                1,
+                1,
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                zero_pixel.as_ptr() as *const _,
+            );
+            gl::BindTexture(gl::TEXTURE_2D, 0);
+            gl::ActiveTexture(gl::TEXTURE0);
+
+            gl::BindFramebuffer(gl::FRAMEBUFFER, ping_fbo);
+            gl::FramebufferTexture2D(
+                gl::FRAMEBUFFER,
+                gl::COLOR_ATTACHMENT0,
+                gl::TEXTURE_2D,
+                ping_texture,
+                0,
+            );
+
+            let ping_status = gl::CheckFramebufferStatus(gl::FRAMEBUFFER);
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+
+            if ping_status != gl::FRAMEBUFFER_COMPLETE {
+                gl::DeleteFramebuffers(1, &ping_fbo);
+                gl::DeleteTextures(1, &ping_texture);
+                gl::DeleteFramebuffers(1, &fbo);
+                gl::DeleteTextures(1, &color_texture);
+                gl::DeleteBuffers(1, &vbo);
+                gl::DeleteVertexArrays(1, &vao);
+                return Err(format!("Ping framebuffer is not complete: {ping_status}").into());
+            }
         }
 
         Ok(Self {
@@ -307,38 +357,64 @@ impl PostProcessState {
             vbo,
             passthrough_program,
             u_screen_texture,
-            custom_program: None,
-            custom_uniforms: None,
+            ping_texture,
+            ping_fbo,
+            custom_shaders: Vec::new(),
         })
     }
 
     pub fn has_custom_shader(&self) -> bool {
-        self.custom_program.is_some()
+        !self.custom_shaders.is_empty()
     }
 
-    /// Load a custom fragment shader from the filesystem.
-    pub fn load_custom_shader(&mut self, path: &Path) -> Result<(), String> {
-        let source = std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read shader file {}: {e}", path.display()))?;
+    /// Load multiple custom fragment shaders from the filesystem.
+    pub fn load_custom_shaders(&mut self, paths: &[PathBuf]) -> Vec<(PathBuf, String)> {
+        let mut errors = Vec::new();
+        let mut shaders = Vec::new();
 
         let prefix = include_str!("../../res/shadertoy_prefix.glsl");
         let vertex = include_str!("../../res/post_process.v.glsl");
 
-        let processed = preprocess_shader_for_macos(&source);
+        for path in paths {
+            let source = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    errors.push((path.clone(), format!("read error: {e}")));
+                    continue;
+                },
+            };
+            let processed = preprocess_shader_for_macos(&source);
+            match ShaderProgram::new_post_process(vertex, prefix, &processed) {
+                Ok(program) => {
+                    let uniforms = CustomShaderUniforms::from_program(&program);
+                    shaders.push((program, uniforms));
+                },
+                Err(e) => {
+                    errors.push((path.clone(), format!("compile error: {e}")));
+                },
+            }
+        }
 
-        let program = ShaderProgram::new_post_process(vertex, prefix, &processed)
-            .map_err(|e| format!("Failed to compile custom shader {}: {e}", path.display()))?;
-
-        let uniforms = CustomShaderUniforms::from_program(&program);
-        self.custom_program = Some(program);
-        self.custom_uniforms = Some(uniforms);
-        Ok(())
+        self.custom_shaders = shaders;
+        errors
     }
 
-    /// Remove the loaded custom shader, reverting to the passthrough post-process pass.
+    /// Load a single custom fragment shader (backward-compatible wrapper).
+    #[allow(dead_code)]
+    pub fn load_custom_shader(&mut self, path: &Path) -> Result<(), String> {
+        let errors = self.load_custom_shaders(&[path.to_path_buf()]);
+        if let Some((_, e)) = errors.into_iter().next() {
+            Err(e)
+        } else if self.custom_shaders.is_empty() {
+            Err("No shader loaded".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Remove loaded custom shaders, reverting to the passthrough post-process pass.
     pub fn clear_custom_shader(&mut self) {
-        self.custom_program = None;
-        self.custom_uniforms = None;
+        self.custom_shaders.clear();
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -372,6 +448,23 @@ impl PostProcessState {
                 gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0,
                 gl::TEXTURE_2D, self.color_texture, 0,
             );
+            gl::ActiveTexture(gl::TEXTURE1);
+            gl::BindTexture(gl::TEXTURE_2D, self.ping_texture);
+            gl::TexImage2D(
+                gl::TEXTURE_2D, 0, gl::RGBA8 as i32,
+                width as i32, height as i32, 0,
+                gl::RGBA, gl::UNSIGNED_BYTE, std::ptr::null(),
+            );
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_BASE_LEVEL, 0);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAX_LEVEL, 0);
+            gl::BindTexture(gl::TEXTURE_2D, 0);
+            gl::ActiveTexture(gl::TEXTURE0);
+
+            gl::BindFramebuffer(gl::FRAMEBUFFER, self.ping_fbo);
+            gl::FramebufferTexture2D(
+                gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0,
+                gl::TEXTURE_2D, self.ping_texture, 0,
+            );
             gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
         }
     }
@@ -384,37 +477,74 @@ impl PostProcessState {
 
     pub fn draw(&self, width: u32, height: u32, uniforms: &ShaderUniformValues) {
         unsafe {
-            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-            gl::Viewport(0, 0, width as i32, height as i32);
-
             gl::Disable(gl::BLEND);
-            gl::Clear(gl::COLOR_BUFFER_BIT);
 
-            let channel0_loc = if let (Some(prog), Some(u)) =
-                (&self.custom_program, &self.custom_uniforms)
-            {
-                gl::UseProgram(prog.id());
-                u.apply(uniforms);
-                u.i_channel0
+            let shader_count = self.custom_shaders.len();
+            if shader_count <= 1 {
+                gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+                gl::Viewport(0, 0, width as i32, height as i32);
+                gl::Clear(gl::COLOR_BUFFER_BIT);
+
+                let channel0_loc = if let Some((prog, u)) = self.custom_shaders.first() {
+                    gl::UseProgram(prog.id());
+                    u.apply(uniforms);
+                    u.i_channel0
+                } else {
+                    gl::UseProgram(self.passthrough_program.id());
+                    self.u_screen_texture
+                };
+
+                gl::ActiveTexture(gl::TEXTURE1);
+                gl::BindTexture(gl::TEXTURE_2D, self.color_texture);
+                if channel0_loc >= 0 {
+                    gl::Uniform1i(channel0_loc, 1);
+                }
+
+                gl::BindVertexArray(self.vao);
+                gl::DrawArrays(gl::TRIANGLES, 0, 3);
+                gl::BindVertexArray(0);
             } else {
-                gl::UseProgram(self.passthrough_program.id());
-                self.u_screen_texture
-            };
+                let mut back = self.color_texture;
+                let mut front = self.ping_texture;
 
-            // Use GL_TEXTURE1 for the FBO texture to avoid disturbing
-            // GL_TEXTURE0 which the text renderer's glyph atlas occupies.
-            // The text renderer tracks its binding state and skips re-binding
-            // if it thinks the atlas is already on unit 0.
-            gl::ActiveTexture(gl::TEXTURE1);
-            gl::BindTexture(gl::TEXTURE_2D, self.color_texture);
-            if channel0_loc >= 0 {
-                gl::Uniform1i(channel0_loc, 1);
+                for (i, (prog, u)) in self.custom_shaders.iter().enumerate() {
+                    let is_last = i == shader_count - 1;
+
+                    if is_last {
+                        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+                        gl::Viewport(0, 0, width as i32, height as i32);
+                        gl::Clear(gl::COLOR_BUFFER_BIT);
+                    } else {
+                        gl::BindFramebuffer(gl::FRAMEBUFFER, self.ping_fbo);
+                        gl::FramebufferTexture2D(
+                            gl::FRAMEBUFFER,
+                            gl::COLOR_ATTACHMENT0,
+                            gl::TEXTURE_2D,
+                            front,
+                            0,
+                        );
+                        gl::Viewport(0, 0, width as i32, height as i32);
+                    }
+
+                    gl::UseProgram(prog.id());
+                    u.apply(uniforms);
+
+                    gl::ActiveTexture(gl::TEXTURE1);
+                    gl::BindTexture(gl::TEXTURE_2D, back);
+                    if u.i_channel0 >= 0 {
+                        gl::Uniform1i(u.i_channel0, 1);
+                    }
+
+                    gl::BindVertexArray(self.vao);
+                    gl::DrawArrays(gl::TRIANGLES, 0, 3);
+                    gl::BindVertexArray(0);
+
+                    if !is_last {
+                        std::mem::swap(&mut back, &mut front);
+                    }
+                }
             }
 
-            gl::BindVertexArray(self.vao);
-            gl::DrawArrays(gl::TRIANGLES, 0, 3);
-
-            gl::BindVertexArray(0);
             gl::UseProgram(0);
             gl::BindTexture(gl::TEXTURE_2D, 0);
             gl::ActiveTexture(gl::TEXTURE0);
@@ -429,7 +559,9 @@ impl Drop for PostProcessState {
     fn drop(&mut self) {
         unsafe {
             gl::DeleteFramebuffers(1, &self.fbo);
+            gl::DeleteFramebuffers(1, &self.ping_fbo);
             gl::DeleteTextures(1, &self.color_texture);
+            gl::DeleteTextures(1, &self.ping_texture);
             gl::DeleteBuffers(1, &self.vbo);
             gl::DeleteVertexArrays(1, &self.vao);
         }
