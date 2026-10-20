@@ -6,10 +6,11 @@ use serde::Serialize;
 /// Custom shader configuration.
 #[derive(ConfigDeserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShaderConfig {
-    /// Custom shader file paths.
+    /// Custom shader entries.
     ///
-    /// Paths may be absolute, relative to the configuration file directory, or use `~` for the
-    /// user's home directory.
+    /// Each entry may be a built-in shader name (e.g. `cursor_sweep`), a file path, or a mix of
+    /// both. Paths may be absolute, relative to the configuration file directory, or use `~` for
+    /// the user's home directory.
     #[serde(default)]
     pub custom_shader: Vec<PathBuf>,
 

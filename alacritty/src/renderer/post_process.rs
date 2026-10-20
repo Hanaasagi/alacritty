@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use crate::gl;
 use crate::gl::types::*;
-use crate::renderer::shader::{ShaderProgram, ShaderVersion};
 use crate::renderer::Error;
+use crate::renderer::shader::{ShaderProgram, ShaderVersion};
 
 const POST_PROCESS_SHADER_V: &str = include_str!("../../res/post_process.v.glsl");
 const POST_PROCESS_SHADER_F: &str = include_str!("../../res/post_process.f.glsl");
@@ -192,6 +192,13 @@ fn uniform_location(program: &ShaderProgram, name: &CStr) -> GLint {
     unsafe { gl::GetUniformLocation(program.id(), name.as_ptr()) }
 }
 
+/// A shader to load from disk or from an in-memory GLSL source string.
+#[derive(Debug, Clone)]
+pub enum ShaderEntry {
+    File(PathBuf),
+    Source { label: PathBuf, source: &'static str },
+}
+
 #[derive(Debug)]
 pub struct PostProcessState {
     fbo: GLuint,
@@ -371,22 +378,45 @@ impl PostProcessState {
         !self.custom_shaders.is_empty()
     }
 
-    /// Load multiple custom fragment shaders from the filesystem.
-    pub fn load_custom_shaders(&mut self, paths: &[PathBuf]) -> Vec<(PathBuf, String)> {
+    /// Compile a custom shader from GLSL source string (for built-in shaders).
+    #[allow(dead_code)]
+    pub fn load_shader_from_source(&mut self, source: &str) -> Result<(), String> {
+        let prefix = include_str!("../../res/shadertoy_prefix.glsl");
+        let vertex = include_str!("../../res/post_process.v.glsl");
+        let processed = preprocess_shader_for_macos(source);
+        let program = ShaderProgram::new_post_process(vertex, prefix, &processed)
+            .map_err(|e| format!("Failed to compile shader: {e}"))?;
+        let uniforms = CustomShaderUniforms::from_program(&program);
+        self.custom_shaders.push((program, uniforms));
+        Ok(())
+    }
+
+    /// Load shaders from a mix of file paths and in-memory GLSL source.
+    pub fn load_shaders(&mut self, entries: &[ShaderEntry]) -> Vec<(PathBuf, String)> {
         let mut errors = Vec::new();
         let mut shaders = Vec::new();
 
         let prefix = include_str!("../../res/shadertoy_prefix.glsl");
         let vertex = include_str!("../../res/post_process.v.glsl");
 
-        for path in paths {
-            let source = match std::fs::read_to_string(path) {
+        for entry in entries {
+            let (label, source_result) = match entry {
+                ShaderEntry::File(path) => {
+                    let source =
+                        std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"));
+                    (path.clone(), source)
+                },
+                ShaderEntry::Source { label, source } => (label.clone(), Ok((*source).to_owned())),
+            };
+
+            let source = match source_result {
                 Ok(s) => s,
                 Err(e) => {
-                    errors.push((path.clone(), format!("read error: {e}")));
+                    errors.push((label, e));
                     continue;
                 },
             };
+
             let processed = preprocess_shader_for_macos(&source);
             match ShaderProgram::new_post_process(vertex, prefix, &processed) {
                 Ok(program) => {
@@ -394,13 +424,19 @@ impl PostProcessState {
                     shaders.push((program, uniforms));
                 },
                 Err(e) => {
-                    errors.push((path.clone(), format!("compile error: {e}")));
+                    errors.push((label, format!("compile error: {e}")));
                 },
             }
         }
 
         self.custom_shaders = shaders;
         errors
+    }
+
+    /// Load multiple custom fragment shaders from the filesystem.
+    pub fn load_custom_shaders(&mut self, paths: &[PathBuf]) -> Vec<(PathBuf, String)> {
+        let entries: Vec<_> = paths.iter().cloned().map(ShaderEntry::File).collect();
+        self.load_shaders(&entries)
     }
 
     /// Load a single custom fragment shader (backward-compatible wrapper).
@@ -437,9 +473,15 @@ impl PostProcessState {
             gl::ActiveTexture(gl::TEXTURE1);
             gl::BindTexture(gl::TEXTURE_2D, self.color_texture);
             gl::TexImage2D(
-                gl::TEXTURE_2D, 0, gl::RGBA8 as i32,
-                width as i32, height as i32, 0,
-                gl::RGBA, gl::UNSIGNED_BYTE, std::ptr::null(),
+                gl::TEXTURE_2D,
+                0,
+                gl::RGBA8 as i32,
+                width as i32,
+                height as i32,
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                std::ptr::null(),
             );
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_BASE_LEVEL, 0);
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAX_LEVEL, 0);
@@ -449,15 +491,24 @@ impl PostProcessState {
             // Re-attach the color texture to the FBO.
             gl::BindFramebuffer(gl::FRAMEBUFFER, self.fbo);
             gl::FramebufferTexture2D(
-                gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0,
-                gl::TEXTURE_2D, self.color_texture, 0,
+                gl::FRAMEBUFFER,
+                gl::COLOR_ATTACHMENT0,
+                gl::TEXTURE_2D,
+                self.color_texture,
+                0,
             );
             gl::ActiveTexture(gl::TEXTURE1);
             gl::BindTexture(gl::TEXTURE_2D, self.ping_texture);
             gl::TexImage2D(
-                gl::TEXTURE_2D, 0, gl::RGBA8 as i32,
-                width as i32, height as i32, 0,
-                gl::RGBA, gl::UNSIGNED_BYTE, std::ptr::null(),
+                gl::TEXTURE_2D,
+                0,
+                gl::RGBA8 as i32,
+                width as i32,
+                height as i32,
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                std::ptr::null(),
             );
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_BASE_LEVEL, 0);
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAX_LEVEL, 0);
@@ -466,8 +517,11 @@ impl PostProcessState {
 
             gl::BindFramebuffer(gl::FRAMEBUFFER, self.ping_fbo);
             gl::FramebufferTexture2D(
-                gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0,
-                gl::TEXTURE_2D, self.ping_texture, 0,
+                gl::FRAMEBUFFER,
+                gl::COLOR_ATTACHMENT0,
+                gl::TEXTURE_2D,
+                self.ping_texture,
+                0,
             );
             gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
         }
@@ -574,22 +628,61 @@ impl Drop for PostProcessState {
 
 /// GLSL type keywords that begin a variable declaration at global scope.
 const GLSL_TYPE_PREFIXES: &[&str] = &[
-    "vec2 ", "vec3 ", "vec4 ", "float ", "int ", "uint ", "bool ",
-    "mat2 ", "mat3 ", "mat4 ", "ivec2 ", "ivec3 ", "ivec4 ",
-    "uvec2 ", "uvec3 ", "uvec4 ", "bvec2 ", "bvec3 ", "bvec4 ",
-    "mat2x2 ", "mat2x3 ", "mat2x4 ", "mat3x2 ", "mat3x3 ", "mat3x4 ",
-    "mat4x2 ", "mat4x3 ", "mat4x4 ",
+    "vec2 ", "vec3 ", "vec4 ", "float ", "int ", "uint ", "bool ", "mat2 ", "mat3 ", "mat4 ",
+    "ivec2 ", "ivec3 ", "ivec4 ", "uvec2 ", "uvec3 ", "uvec4 ", "bvec2 ", "bvec3 ", "bvec4 ",
+    "mat2x2 ", "mat2x3 ", "mat2x4 ", "mat3x2 ", "mat3x3 ", "mat3x4 ", "mat4x2 ", "mat4x3 ",
+    "mat4x4 ",
 ];
 
 /// GLSL built-in constructor names that look like function calls but are not.
 const GLSL_CONSTRUCTORS: &[&str] = &[
-    "vec2", "vec3", "vec4", "float", "int", "uint", "bool",
-    "mat2", "mat3", "mat4", "ivec2", "ivec3", "ivec4",
-    "uvec2", "uvec3", "uvec4", "bvec2", "bvec3", "bvec4",
-    "min", "max", "clamp", "mix", "step", "smoothstep", "pow",
-    "abs", "sign", "floor", "ceil", "fract", "mod", "sqrt",
-    "sin", "cos", "tan", "asin", "acos", "atan", "exp", "log",
-    "exp2", "log2", "length", "distance", "dot", "cross",
+    "vec2",
+    "vec3",
+    "vec4",
+    "float",
+    "int",
+    "uint",
+    "bool",
+    "mat2",
+    "mat3",
+    "mat4",
+    "ivec2",
+    "ivec3",
+    "ivec4",
+    "uvec2",
+    "uvec3",
+    "uvec4",
+    "bvec2",
+    "bvec3",
+    "bvec4",
+    "min",
+    "max",
+    "clamp",
+    "mix",
+    "step",
+    "smoothstep",
+    "pow",
+    "abs",
+    "sign",
+    "floor",
+    "ceil",
+    "fract",
+    "mod",
+    "sqrt",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "exp",
+    "log",
+    "exp2",
+    "log2",
+    "length",
+    "distance",
+    "dot",
+    "cross",
 ];
 
 /// Check whether a GLSL expression contains a call to a user-defined function.
@@ -771,7 +864,9 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         assert!(result.contains("vec4 TRAIL_COLOR;"));
         assert!(!result.contains("vec4 TRAIL_COLOR = vec4(sRGBToLinear"));
         assert!(result.contains("_alacritty_init_globals"));
-        assert!(result.contains("TRAIL_COLOR = vec4(sRGBToLinear(iCurrentCursorColor.rgb), iCurrentCursorColor.a)"));
+        assert!(result.contains(
+            "TRAIL_COLOR = vec4(sRGBToLinear(iCurrentCursorColor.rgb), iCurrentCursorColor.a)"
+        ));
         assert!(result.contains("const float DURATION = 0.2;"));
     }
 

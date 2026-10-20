@@ -65,8 +65,7 @@ impl ShaderProgram {
         fragment_shader: &str,
     ) -> Result<Self, ShaderError> {
         const VERSION: &str = "#version 330 core\n";
-        let vertex_shader =
-            Shader::new_from_parts(gl::VERTEX_SHADER, &[VERSION, vertex_shader])?;
+        let vertex_shader = Shader::new_from_parts(gl::VERTEX_SHADER, &[VERSION, vertex_shader])?;
         let fragment_shader =
             Shader::new_from_parts(gl::FRAGMENT_SHADER, &[shader_prefix, fragment_shader])?;
 

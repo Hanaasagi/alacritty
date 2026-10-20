@@ -39,8 +39,8 @@ use alacritty_terminal::vte::ansi::{CursorShape, NamedColor};
 
 use crate::config::UiConfig;
 use crate::config::debug::RendererPreference;
-use crate::config::shader::ShaderAnimation;
 use crate::config::font::Font;
+use crate::config::shader::ShaderAnimation;
 use crate::config::window::Dimensions;
 #[cfg(not(windows))]
 use crate::config::window::StartupMode;
@@ -55,8 +55,9 @@ use crate::display::meter::Meter;
 use crate::display::window::Window;
 use crate::event::{Event, EventType, Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
+use crate::renderer::get_builtin_shader;
 use crate::renderer::rects::{RenderLine, RenderLines, RenderRect};
-use crate::renderer::{self, GlyphCache, Renderer, ShaderUniformValues, platform};
+use crate::renderer::{self, GlyphCache, Renderer, ShaderEntry, ShaderUniformValues, platform};
 use crate::scheduler::{Scheduler, TimerId, Topic};
 use crate::string::{ShortenDirection, StrShortener};
 
@@ -465,13 +466,9 @@ impl Display {
         let mut renderer = Renderer::new(&context, config.debug.renderer)?;
 
         if !config.shader.custom_shader.is_empty() {
-            let paths: Vec<PathBuf> = config
-                .shader
-                .custom_shader
-                .iter()
-                .map(|p| resolve_shader_path(p, &config.config_paths))
-                .collect();
-            let errors = renderer.load_custom_shaders(&paths);
+            let entries =
+                resolve_shader_entries(&config.shader.custom_shader, &config.config_paths);
+            let errors = renderer.load_shaders(&entries);
             for (path, err) in errors {
                 log::warn!("Custom shader load failed for {}: {err}", path.display());
             }
@@ -613,13 +610,19 @@ impl Display {
     /// Redraw and reschedule shader animation after a focus change.
     ///
     /// Returns `true` if a redraw is needed to refresh shader uniforms.
-    pub fn handle_shader_focus_change(&mut self, config: &UiConfig, scheduler: &mut Scheduler) -> bool {
+    pub fn handle_shader_focus_change(
+        &mut self,
+        config: &UiConfig,
+        scheduler: &mut Scheduler,
+    ) -> bool {
         if !self.renderer.has_custom_shader() {
             return false;
         }
 
         match config.shader.animation {
-            ShaderAnimation::Always | ShaderAnimation::Focused => self.schedule_shader_redraw(scheduler),
+            ShaderAnimation::Always | ShaderAnimation::Focused => {
+                self.schedule_shader_redraw(scheduler)
+            },
             ShaderAnimation::Off | ShaderAnimation::WhenNeeded => {},
         }
 
@@ -640,8 +643,7 @@ impl Display {
                 if !self.shader_animating {
                     return false;
                 }
-                Instant::now().duration_since(self.cursor_tracker.change_time()).as_secs_f32()
-                    < 1.0
+                Instant::now().duration_since(self.cursor_tracker.change_time()).as_secs_f32() < 1.0
             },
         }
     }
@@ -1264,13 +1266,9 @@ impl Display {
 
     fn reload_custom_shaders(&mut self, config: &UiConfig) {
         if !config.shader.custom_shader.is_empty() {
-            let paths: Vec<PathBuf> = config
-                .shader
-                .custom_shader
-                .iter()
-                .map(|p| resolve_shader_path(p, &config.config_paths))
-                .collect();
-            let errors = self.renderer.load_custom_shaders(&paths);
+            let entries =
+                resolve_shader_entries(&config.shader.custom_shader, &config.config_paths);
+            let errors = self.renderer.load_shaders(&entries);
             for (path, err) in &errors {
                 log::warn!("Custom shader reload failed for {}: {err}", path.display());
             }
@@ -1687,7 +1685,29 @@ impl Display {
             }
         }
     }
+}
 
+/// Resolve configured shader entries, treating bare names as built-in shaders.
+fn resolve_shader_entries(paths: &[PathBuf], config_paths: &[PathBuf]) -> Vec<ShaderEntry> {
+    paths
+        .iter()
+        .map(|path| {
+            if let Some(name) = path.to_str().filter(|name| is_shader_builtin_name(name)) {
+                if let Some(source) = get_builtin_shader(name) {
+                    return ShaderEntry::Source { label: path.clone(), source };
+                }
+            }
+            ShaderEntry::File(resolve_shader_path(path, config_paths))
+        })
+        .collect()
+}
+
+fn is_shader_builtin_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.starts_with('~')
+        && !name.contains('.')
 }
 
 /// Resolve a shader path: expand `~` and resolve relative paths against the config directory.

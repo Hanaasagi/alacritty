@@ -24,13 +24,16 @@ use crate::renderer::post_process::PostProcessState;
 use crate::renderer::rects::{RectRenderer, RenderRect};
 use crate::renderer::shader::ShaderError;
 
+mod builtin_shaders;
 pub mod platform;
-pub mod rects;
 mod post_process;
+pub mod rects;
 mod shader;
 mod text;
 
-pub use post_process::ShaderUniformValues;
+pub use builtin_shaders::get_builtin_shader;
+
+pub use post_process::{ShaderEntry, ShaderUniformValues};
 pub use text::{GlyphCache, LoaderApi};
 
 use shader::ShaderVersion;
@@ -373,7 +376,39 @@ impl Renderer {
         self.invalidate_text_texture_cache();
     }
 
+    /// Compile a custom post-process shader from GLSL source (e.g. built-in shaders).
+    #[allow(dead_code)]
+    pub fn load_shader_from_source(&mut self, source: &str) -> Result<(), String> {
+        if let Some(pp) = &mut self.post_process {
+            pp.load_shader_from_source(source)
+        } else {
+            Err("Post-processing is not available".to_owned())
+        }
+    }
+
+    /// Load post-process shaders from files and/or in-memory GLSL source.
+    pub fn load_shaders(
+        &mut self,
+        entries: &[post_process::ShaderEntry],
+    ) -> Vec<(std::path::PathBuf, String)> {
+        if let Some(pp) = &mut self.post_process {
+            pp.load_shaders(entries)
+        } else {
+            entries
+                .iter()
+                .map(|entry| {
+                    let label = match entry {
+                        post_process::ShaderEntry::File(path) => path.clone(),
+                        post_process::ShaderEntry::Source { label, .. } => label.clone(),
+                    };
+                    (label, "Post-processing is not available".to_owned())
+                })
+                .collect()
+        }
+    }
+
     /// Load multiple custom post-process shaders from the filesystem.
+    #[allow(dead_code)]
     pub fn load_custom_shaders(
         &mut self,
         paths: &[std::path::PathBuf],
