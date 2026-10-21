@@ -4,10 +4,9 @@ use std::path::{Path, PathBuf};
 use crate::gl;
 use crate::gl::types::*;
 use crate::renderer::Error;
-use crate::renderer::shader::{ShaderProgram, ShaderVersion};
+use crate::renderer::shader::ShaderProgram;
 
 const POST_PROCESS_SHADER_V: &str = include_str!("../../res/post_process.v.glsl");
-const POST_PROCESS_SHADER_F: &str = include_str!("../../res/post_process.f.glsl");
 
 /// Per-frame shader uniform values passed from the display to the post-process pass.
 #[derive(Debug, Clone, Copy)]
@@ -199,6 +198,16 @@ pub enum ShaderEntry {
     Source { label: PathBuf, source: &'static str },
 }
 
+impl ShaderEntry {
+    /// Label used to identify the shader in error messages.
+    pub fn label(&self) -> &Path {
+        match self {
+            Self::File(path) => path,
+            Self::Source { label, .. } => label,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PostProcessState {
     fbo: GLuint,
@@ -207,8 +216,6 @@ pub struct PostProcessState {
     height: u32,
     vao: GLuint,
     vbo: GLuint,
-    passthrough_program: ShaderProgram,
-    u_screen_texture: GLint,
     ping_texture: GLuint,
     ping_fbo: GLuint,
     custom_shaders: Vec<(ShaderProgram, CustomShaderUniforms)>,
@@ -216,14 +223,6 @@ pub struct PostProcessState {
 
 impl PostProcessState {
     pub fn new() -> Result<Self, Error> {
-        let passthrough_program = ShaderProgram::new(
-            ShaderVersion::Glsl3,
-            None,
-            POST_PROCESS_SHADER_V,
-            POST_PROCESS_SHADER_F,
-        )?;
-        let u_screen_texture = passthrough_program.get_uniform_location(c"screenTexture")?;
-
         let mut fbo: GLuint = 0;
         let mut color_texture: GLuint = 0;
         let mut ping_texture: GLuint = 0;
@@ -366,8 +365,6 @@ impl PostProcessState {
             height: 1,
             vao,
             vbo,
-            passthrough_program,
-            u_screen_texture,
             ping_texture,
             ping_fbo,
             custom_shaders: Vec::new(),
@@ -378,26 +375,12 @@ impl PostProcessState {
         !self.custom_shaders.is_empty()
     }
 
-    /// Compile a custom shader from GLSL source string (for built-in shaders).
-    #[allow(dead_code)]
-    pub fn load_shader_from_source(&mut self, source: &str) -> Result<(), String> {
-        let prefix = include_str!("../../res/shadertoy_prefix.glsl");
-        let vertex = include_str!("../../res/post_process.v.glsl");
-        let processed = preprocess_shader_for_macos(source);
-        let program = ShaderProgram::new_post_process(vertex, prefix, &processed)
-            .map_err(|e| format!("Failed to compile shader: {e}"))?;
-        let uniforms = CustomShaderUniforms::from_program(&program);
-        self.custom_shaders.push((program, uniforms));
-        Ok(())
-    }
-
     /// Load shaders from a mix of file paths and in-memory GLSL source.
     pub fn load_shaders(&mut self, entries: &[ShaderEntry]) -> Vec<(PathBuf, String)> {
         let mut errors = Vec::new();
         let mut shaders = Vec::new();
 
         let prefix = include_str!("../../res/shadertoy_prefix.glsl");
-        let vertex = include_str!("../../res/post_process.v.glsl");
 
         for entry in entries {
             let (label, source_result) = match entry {
@@ -418,7 +401,7 @@ impl PostProcessState {
             };
 
             let processed = preprocess_shader_for_macos(&source);
-            match ShaderProgram::new_post_process(vertex, prefix, &processed) {
+            match ShaderProgram::new_post_process(POST_PROCESS_SHADER_V, prefix, &processed) {
                 Ok(program) => {
                     let uniforms = CustomShaderUniforms::from_program(&program);
                     shaders.push((program, uniforms));
@@ -431,30 +414,6 @@ impl PostProcessState {
 
         self.custom_shaders = shaders;
         errors
-    }
-
-    /// Load multiple custom fragment shaders from the filesystem.
-    pub fn load_custom_shaders(&mut self, paths: &[PathBuf]) -> Vec<(PathBuf, String)> {
-        let entries: Vec<_> = paths.iter().cloned().map(ShaderEntry::File).collect();
-        self.load_shaders(&entries)
-    }
-
-    /// Load a single custom fragment shader (backward-compatible wrapper).
-    #[allow(dead_code)]
-    pub fn load_custom_shader(&mut self, path: &Path) -> Result<(), String> {
-        let errors = self.load_custom_shaders(&[path.to_path_buf()]);
-        if let Some((_, e)) = errors.into_iter().next() {
-            Err(e)
-        } else if self.custom_shaders.is_empty() {
-            Err("No shader loaded".to_owned())
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Remove loaded custom shaders, reverting to the passthrough post-process pass.
-    pub fn clear_custom_shader(&mut self) {
-        self.custom_shaders.clear();
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -534,28 +493,27 @@ impl PostProcessState {
     }
 
     pub fn draw(&self, width: u32, height: u32, uniforms: &ShaderUniformValues) {
+        let shader_count = self.custom_shaders.len();
+        if shader_count == 0 {
+            return;
+        }
+
         unsafe {
             gl::Disable(gl::BLEND);
 
-            let shader_count = self.custom_shaders.len();
-            if shader_count <= 1 {
+            if shader_count == 1 {
+                let (prog, u) = &self.custom_shaders[0];
                 gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
                 gl::Viewport(0, 0, width as i32, height as i32);
                 gl::Clear(gl::COLOR_BUFFER_BIT);
 
-                let channel0_loc = if let Some((prog, u)) = self.custom_shaders.first() {
-                    gl::UseProgram(prog.id());
-                    u.apply(uniforms);
-                    u.i_channel0
-                } else {
-                    gl::UseProgram(self.passthrough_program.id());
-                    self.u_screen_texture
-                };
+                gl::UseProgram(prog.id());
+                u.apply(uniforms);
 
                 gl::ActiveTexture(gl::TEXTURE1);
                 gl::BindTexture(gl::TEXTURE_2D, self.color_texture);
-                if channel0_loc >= 0 {
-                    gl::Uniform1i(channel0_loc, 1);
+                if u.i_channel0 >= 0 {
+                    gl::Uniform1i(u.i_channel0, 1);
                 }
 
                 gl::BindVertexArray(self.vao);

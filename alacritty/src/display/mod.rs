@@ -607,26 +607,11 @@ impl Display {
         }
     }
 
-    /// Redraw and reschedule shader animation after a focus change.
+    /// Redraw after a focus change when custom shaders consume the focus uniforms.
     ///
     /// Returns `true` if a redraw is needed to refresh shader uniforms.
-    pub fn handle_shader_focus_change(
-        &mut self,
-        config: &UiConfig,
-        scheduler: &mut Scheduler,
-    ) -> bool {
-        if !self.renderer.has_custom_shader() {
-            return false;
-        }
-
-        match config.shader.animation {
-            ShaderAnimation::Always | ShaderAnimation::Focused => {
-                self.schedule_shader_redraw(scheduler)
-            },
-            ShaderAnimation::Off | ShaderAnimation::WhenNeeded => {},
-        }
-
-        true
+    pub fn handle_shader_focus_change(&mut self) -> bool {
+        self.renderer.has_custom_shader()
     }
 
     /// Whether continuous shader animation redraw is needed after the current frame.
@@ -890,6 +875,8 @@ impl Display {
         config: &UiConfig,
         search_state: &mut SearchState,
     ) {
+        let has_custom_shader = self.renderer.has_custom_shader();
+
         // Collect renderable content before the terminal is dropped.
         let mut content = RenderableContent::new(config, self, &terminal, search_state);
         let mut grid_cells = Vec::new();
@@ -900,9 +887,12 @@ impl Display {
         let foreground_color = content.color(NamedColor::Foreground as usize);
         let background_color = content.color(NamedColor::Background as usize);
 
+        // Build the 256-color palette only when a shader consumes it.
         let mut palette = [[0.0f32; 3]; 256];
-        for i in 0..256 {
-            palette[i] = rgb_to_f32(content.color(i));
+        if has_custom_shader {
+            for (i, color) in palette.iter_mut().enumerate() {
+                *color = rgb_to_f32(content.color(i));
+            }
         }
 
         let display_offset = content.display_offset();
@@ -917,28 +907,20 @@ impl Display {
             self.shader_start_time,
         );
 
-        if self.renderer.has_custom_shader() {
-            match config.shader.animation {
-                ShaderAnimation::Always => self.schedule_shader_redraw(scheduler),
-                ShaderAnimation::Focused if self.shader_focused => {
-                    self.schedule_shader_redraw(scheduler);
-                },
-                ShaderAnimation::WhenNeeded => {
-                    if cursor_changed {
-                        self.shader_animating = true;
-                    }
-                    if self.shader_animating {
-                        let elapsed = Instant::now()
-                            .duration_since(self.cursor_tracker.change_time())
-                            .as_secs_f32();
-                        if elapsed < 1.0 {
-                            self.schedule_shader_redraw(scheduler);
-                        } else {
-                            self.shader_animating = false;
-                        }
-                    }
-                },
-                ShaderAnimation::Off | ShaderAnimation::Focused => {},
+        // Track cursor shader animation state; redraw requests go through the regular frame
+        // scheduling (see `shader_animation_wants_redraw`).
+        if has_custom_shader
+            && config.shader.animation == ShaderAnimation::WhenNeeded
+        {
+            if cursor_changed {
+                self.shader_animating = true;
+            }
+            if self.shader_animating {
+                let elapsed =
+                    Instant::now().duration_since(self.cursor_tracker.change_time()).as_secs_f32();
+                if elapsed >= 1.0 {
+                    self.shader_animating = false;
+                }
             }
         }
 
@@ -971,7 +953,8 @@ impl Display {
 
         let requires_full_damage = self.visual_bell.intensity() != 0.
             || self.hint_state.active()
-            || search_state.regex().is_some();
+            || search_state.regex().is_some()
+            || has_custom_shader;
         if requires_full_damage {
             self.damage_tracker.frame().mark_fully_damaged();
             self.damage_tracker.next_frame().mark_fully_damaged();
@@ -992,7 +975,7 @@ impl Display {
             self.reload_custom_shaders(config);
         }
 
-        self.renderer.bind_post_process_fbo();
+        self.renderer.bind_post_process_fbo(&self.size_info);
 
         self.renderer.clear(background_color, config.window_opacity());
         let mut lines = RenderLines::new();
@@ -1175,56 +1158,65 @@ impl Display {
             self.draw_hyperlink_preview(config, cursor_point, display_offset);
         }
 
+        // Time bookkeeping stays unconditional so `iTimeDelta`/`iFrame` don't spike when a
+        // shader is loaded at runtime.
         let now = Instant::now();
         let time = now.duration_since(self.shader_start_time).as_secs_f32();
         let time_delta = now.duration_since(self.shader_last_frame_time).as_secs_f32();
         self.shader_last_frame_time = now;
         self.shader_frame_count += 1;
 
-        let current = self.cursor_tracker.current();
-        let previous = self.cursor_tracker.previous();
-        let time_cursor_change =
-            self.cursor_tracker.change_time().duration_since(self.shader_start_time).as_secs_f32();
-        let frame_rate = if time_delta > 0.0 { 1.0 / time_delta } else { 60.0 };
+        if has_custom_shader {
+            let current = self.cursor_tracker.current();
+            let previous = self.cursor_tracker.previous();
+            let time_cursor_change = self
+                .cursor_tracker
+                .change_time()
+                .duration_since(self.shader_start_time)
+                .as_secs_f32();
+            let frame_rate = if time_delta > 0.0 { 1.0 / time_delta } else { 60.0 };
 
-        let resolution = [self.size_info.width(), self.size_info.height(), 1.0];
+            let resolution = [self.size_info.width(), self.size_info.height(), 1.0];
 
-        let uniform_values = ShaderUniformValues {
-            resolution,
-            time,
-            time_delta,
-            frame: self.shader_frame_count,
-            frame_rate,
-            mouse: self.shader_mouse,
-            current_cursor: [current.x, current.y, current.width, current.height],
-            previous_cursor: [previous.x, previous.y, previous.width, previous.height],
-            current_cursor_color: current.color,
-            previous_cursor_color: previous.color,
-            current_cursor_style: current.style,
-            previous_cursor_style: previous.style,
-            cursor_visible: i32::from(cursor.shape() != CursorShape::Hidden),
-            time_cursor_change,
-            focus: i32::from(self.shader_focused),
-            time_focus: self.shader_focus_time.duration_since(self.shader_start_time).as_secs_f32(),
-            background_color: rgb_to_f32(background_color),
-            foreground_color: rgb_to_f32(foreground_color),
-            cursor_color_rgb: [current.color[0], current.color[1], current.color[2]],
-            cursor_text: [0.0, 0.0, 0.0],
-            selection_fg_color: [1.0, 1.0, 1.0],
-            selection_bg_color: [0.3, 0.3, 0.8],
-            sample_rate: 0.0,
-            date: [0.0; 4],
-            channel_resolution: [resolution, [0.0; 3], [0.0; 3], [0.0; 3]],
-            channel_time: [0.0; 4],
-            palette,
-        };
+            let uniform_values = ShaderUniformValues {
+                resolution,
+                time,
+                time_delta,
+                frame: self.shader_frame_count,
+                frame_rate,
+                mouse: self.shader_mouse,
+                current_cursor: [current.x, current.y, current.width, current.height],
+                previous_cursor: [previous.x, previous.y, previous.width, previous.height],
+                current_cursor_color: current.color,
+                previous_cursor_color: previous.color,
+                current_cursor_style: current.style,
+                previous_cursor_style: previous.style,
+                cursor_visible: i32::from(cursor.shape() != CursorShape::Hidden),
+                time_cursor_change,
+                focus: i32::from(self.shader_focused),
+                time_focus: self
+                    .shader_focus_time
+                    .duration_since(self.shader_start_time)
+                    .as_secs_f32(),
+                background_color: rgb_to_f32(background_color),
+                foreground_color: rgb_to_f32(foreground_color),
+                cursor_color_rgb: [current.color[0], current.color[1], current.color[2]],
+                cursor_text: [0.0, 0.0, 0.0],
+                selection_fg_color: [1.0, 1.0, 1.0],
+                selection_bg_color: [0.3, 0.3, 0.8],
+                sample_rate: 0.0,
+                date: [0.0; 4],
+                channel_resolution: [resolution, [0.0; 3], [0.0; 3], [0.0; 3]],
+                channel_time: [0.0; 4],
+                palette,
+            };
 
-        self.renderer.draw_post_process(
-            self.size_info.width() as u32,
-            self.size_info.height() as u32,
-            &uniform_values,
-        );
-        self.renderer.set_viewport(&self.size_info);
+            self.renderer.draw_post_process(
+                self.size_info.width() as u32,
+                self.size_info.height() as u32,
+                &uniform_values,
+            );
+        }
 
         // Notify winit that we're about to present.
         self.window.pre_present_notify();
@@ -1258,6 +1250,9 @@ impl Display {
 
     /// Update to a new configuration.
     pub fn update_config(&mut self, config: &UiConfig) {
+        // Shader (re)compilation and GL object destruction require this window's context.
+        self.make_current();
+
         self.damage_tracker.debug = config.debug.highlight_damage;
         self.visual_bell.update_config(&config.bell);
         self.colors = List::from(&config.colors);
@@ -1293,19 +1288,6 @@ impl Display {
             self.shader_focus_time = now;
             self.cursor_tracker.reset(now);
         }
-    }
-
-    fn schedule_shader_redraw(&self, scheduler: &mut Scheduler) {
-        let window_id = self.window.id();
-        let timer_id = TimerId::new(Topic::ShaderAnimation, window_id);
-
-        if scheduler.scheduled(timer_id) {
-            return;
-        }
-
-        let event = Event::new(EventType::Frame, window_id);
-        let interval = Duration::from_millis(8);
-        scheduler.schedule(event, interval, false, timer_id);
     }
 
     /// Update the mouse/vi mode cursor hint highlighting.
