@@ -384,8 +384,24 @@ impl PostProcessState {
                 },
             };
 
-            let processed = preprocess_shader_for_macos(&source);
-            match ShaderProgram::new_post_process(POST_PROCESS_SHADER_V, prefix, &processed) {
+            // The macOS OpenGL linker segfaults on non-const global initializers
+            // calling user-defined functions; reject such shaders with an
+            // actionable error instead of crashing the process.
+            if cfg!(target_os = "macos") {
+                if let Some(decl) = detect_macos_unsafe_global(&source) {
+                    errors.push((
+                        label,
+                        format!(
+                            "global initializer calls a user-defined function, which crashes \
+                             the macOS OpenGL linker: `{decl}`. Assign it inside mainImage() \
+                             instead"
+                        ),
+                    ));
+                    continue;
+                }
+            }
+
+            match ShaderProgram::new_post_process(POST_PROCESS_SHADER_V, prefix, &source) {
                 Ok(program) => {
                     let uniforms = CustomShaderUniforms::from_program(&program);
                     shaders.push((program, uniforms));
@@ -570,185 +586,177 @@ impl Drop for PostProcessState {
 
 /// GLSL type keywords that begin a variable declaration at global scope.
 const GLSL_TYPE_PREFIXES: &[&str] = &[
-    "vec2 ", "vec3 ", "vec4 ", "float ", "int ", "uint ", "bool ", "mat2 ", "mat3 ", "mat4 ",
-    "ivec2 ", "ivec3 ", "ivec4 ", "uvec2 ", "uvec3 ", "uvec4 ", "bvec2 ", "bvec3 ", "bvec4 ",
-    "mat2x2 ", "mat2x3 ", "mat2x4 ", "mat3x2 ", "mat3x3 ", "mat3x4 ", "mat4x2 ", "mat4x3 ",
-    "mat4x4 ",
+    "vec2", "vec3", "vec4", "float", "int", "uint", "bool", "mat2", "mat3", "mat4", "ivec2",
+    "ivec3", "ivec4", "uvec2", "uvec3", "uvec4", "bvec2", "bvec3", "bvec4",
 ];
 
-/// GLSL built-in constructor names that look like function calls but are not.
-const GLSL_CONSTRUCTORS: &[&str] = &[
-    "vec2",
-    "vec3",
-    "vec4",
-    "float",
-    "int",
-    "uint",
-    "bool",
-    "mat2",
-    "mat3",
-    "mat4",
-    "ivec2",
-    "ivec3",
-    "ivec4",
-    "uvec2",
-    "uvec3",
-    "uvec4",
-    "bvec2",
-    "bvec3",
-    "bvec4",
-    "min",
-    "max",
-    "clamp",
-    "mix",
-    "step",
-    "smoothstep",
-    "pow",
-    "abs",
-    "sign",
-    "floor",
-    "ceil",
-    "fract",
-    "mod",
-    "sqrt",
-    "sin",
-    "cos",
-    "tan",
-    "asin",
-    "acos",
-    "atan",
-    "exp",
-    "log",
-    "exp2",
-    "log2",
-    "length",
-    "distance",
-    "dot",
-    "cross",
-];
-
-/// Check whether a GLSL expression contains a call to a user-defined function.
+/// Detect a global-scope variable declaration whose initializer calls a user-defined
+/// function, e.g. `vec4 C = vec4(myFunc(x), 1.0);`.
 ///
-/// This detects `identifier(` patterns where the identifier is NOT a GLSL
-/// built-in type constructor. Used to identify global variable initializers
-/// that crash macOS's GLSL linker (the `glpLLVMGetFunctionGlobalVariableUse`
-/// null-pointer bug).
-fn has_user_function_call(expr: &str) -> bool {
-    let bytes = expr.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    while i < len {
-        if bytes[i] == b'(' && i > 0 {
-            let end = i;
-            let mut start = i;
-            while start > 0
-                && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_')
-            {
-                start -= 1;
-            }
-            if start < end {
-                let ident = &expr[start..end];
-                if !ident.is_empty() && !GLSL_CONSTRUCTORS.contains(&ident) {
-                    return true;
+/// macOS's OpenGL linker crashes in `glpLLVMGetFunctionGlobalVariableUse` on such
+/// declarations. Returns the offending declaration for error reporting.
+///
+/// Heuristic, intentionally conservative: strips comments and string literals so they
+/// can't pollute scope tracking, collects function names from `name(...)` signatures and
+/// prototypes at global scope, then flags non-const global initializers referencing them.
+/// False positives reject a shader with a clear error; false negatives crash the linker,
+/// so the checks err on the side of flagging.
+fn detect_macos_unsafe_global(source: &str) -> Option<String> {
+    let mut fn_names: Vec<String> = Vec::new();
+    let mut decls: Vec<String> = Vec::new();
+
+    // Split the source into global-scope chunks: function definitions end with `{`,
+    // declarations and prototypes end with `;`.
+    let mut chunk = String::new();
+    let mut depth: i32 = 0;
+    let mut chars = source.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // Strip line comments.
+            '/' if chars.peek() == Some(&'/') => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
                 }
-            }
+                continue;
+            },
+            // Strip block comments.
+            '/' if chars.peek() == Some(&'*') => {
+                let mut prev = ' ';
+                for c in chars.by_ref() {
+                    if prev == '*' && c == '/' {
+                        break;
+                    }
+                    prev = c;
+                }
+                continue;
+            },
+            // Strip string literals.
+            '"' => {
+                for c in chars.by_ref() {
+                    if c == '"' {
+                        break;
+                    }
+                }
+                continue;
+            },
+            // Preprocessor directives glue onto the next statement otherwise.
+            '#' if depth == 0 && chunk.trim().is_empty() => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+                continue;
+            },
+            _ => {},
         }
-        i += 1;
-    }
-    false
-}
 
-/// Preprocess shader source to work around macOS OpenGL driver bugs.
-///
-/// macOS's GLSL linker crashes in `glpLLVMGetFunctionGlobalVariableUse`
-/// when a non-const global variable is initialized with an expression that
-/// contains a user-defined function call (e.g.
-/// `vec4 COLOR = vec4(myFunc(uniform_var.rgb), 1.0);`). This is a known
-/// Apple driver bug affecting cursor-shaders like `cursor_sweep.glsl`.
-///
-/// This function detects such declarations, strips the initializer from the
-/// global scope, and defers it to a `_alacritty_init_globals()` function
-/// that runs per fragment invocation, immediately before `mainImage()`.
-fn preprocess_shader_for_macos(source: &str) -> String {
-    let mut output = String::with_capacity(source.len() + 256);
-    let mut deferred_inits: Vec<String> = Vec::new();
-    let mut brace_depth: i32 = 0;
-
-    for line in source.lines() {
-        let trimmed = line.trim();
-        let depth_at_start = brace_depth;
-
-        for ch in trimmed.chars() {
-            match ch {
-                '{' => brace_depth += 1,
-                '}' => brace_depth -= 1,
+        if depth == 0 {
+            match c {
+                '{' => {
+                    depth += 1;
+                    // `{` at global scope ends a function signature; any return type is
+                    // accepted so user-defined struct returns are covered.
+                    if let Some(name) = signature_fn_name(&chunk, false) {
+                        fn_names.push(name);
+                    }
+                    chunk.clear();
+                },
+                ';' => {
+                    // `;` at global scope ends a declaration or a function prototype.
+                    if let Some(name) = signature_fn_name(&chunk, true) {
+                        fn_names.push(name);
+                    } else {
+                        decls.push(chunk.trim().to_string());
+                    }
+                    chunk.clear();
+                },
+                _ => chunk.push(c),
+            }
+        } else {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
                 _ => {},
             }
         }
+    }
 
-        if depth_at_start == 0 && !trimmed.is_empty() && should_defer_global(trimmed) {
-            if let Some((decl_only, var_name, init_expr)) = split_global_declaration(trimmed) {
-                output.push_str(&decl_only);
-                output.push('\n');
-                deferred_inits.push(format!("    {var_name} = {init_expr};"));
-                continue;
+    for decl in &decls {
+        if !GLSL_TYPE_PREFIXES.iter().any(|t| decl.starts_with(t)) {
+            continue;
+        }
+        let Some(eq) = find_assignment_eq(decl) else { continue };
+        let init = &decl[eq + 1..];
+        if fn_names.iter().any(|name| contains_call(init, name)) {
+            return Some(decl.lines().next().unwrap_or(decl).trim().to_string());
+        }
+    }
+    None
+}
+
+/// Extract the function name from a `type name(params)` chunk. With `require_type`,
+/// the token before the name must be a GLSL type keyword (for prototypes, where the
+/// chunk shape is ambiguous with variable declarations).
+fn signature_fn_name(chunk: &str, require_type: bool) -> Option<String> {
+    let paren = chunk.find('(')?;
+    let before = chunk[..paren].trim_end();
+    // An assignment before the first paren means this is a variable declaration.
+    if before.contains('=') {
+        return None;
+    }
+
+    let name_start =
+        before.rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_').map(|i| i + 1).unwrap_or(0);
+    let name = &before[name_start..];
+    if name.is_empty() {
+        return None;
+    }
+
+    if require_type {
+        let ret = before[..name_start].trim();
+        let is_type = ret == "void" || GLSL_TYPE_PREFIXES.contains(&ret);
+        if !is_type {
+            return None;
+        }
+    }
+
+    Some(name.to_string())
+}
+
+/// Find the first assignment `=` (not `==`, `<=`, `>=`, `!=`).
+fn find_assignment_eq(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'=' {
+            let next_is_eq = bytes.get(i + 1) == Some(&b'=');
+            let prev = i.checked_sub(1).map(|j| bytes[j]);
+            let prev_op = matches!(prev, Some(b'<') | Some(b'>') | Some(b'=') | Some(b'!'));
+            if !next_is_eq && !prev_op {
+                return Some(i);
             }
         }
-
-        output.push_str(line);
-        output.push('\n');
     }
-
-    output.push_str("\nvoid _alacritty_init_globals() {\n");
-    for init in &deferred_inits {
-        output.push_str(init);
-        output.push('\n');
-    }
-    output.push_str("}\n");
-
-    output
+    None
 }
 
-/// Return true if a global-scope line is a non-const variable declaration
-/// whose initializer contains a user-defined function call.
-fn should_defer_global(line: &str) -> bool {
-    if line.starts_with("const ")
-        || line.starts_with("uniform ")
-        || line.starts_with("in ")
-        || line.starts_with("out ")
-        || line.starts_with("layout")
-        || line.starts_with("//")
-        || line.starts_with('#')
-        || line.starts_with("void ")
-        || line.starts_with("struct ")
-    {
-        return false;
+/// Whether `expr` contains a call to `name` (whole identifier followed by `(`).
+fn contains_call(expr: &str, name: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = expr[start..].find(name) {
+        let abs = start + pos;
+        let before_ok = abs == 0 || {
+            let c = expr.as_bytes()[abs - 1];
+            !(c.is_ascii_alphanumeric() || c == b'_')
+        };
+        if before_ok && expr[abs + name.len()..].trim_start().starts_with('(') {
+            return true;
+        }
+        start = abs + name.len();
     }
-
-    let is_type_decl = GLSL_TYPE_PREFIXES.iter().any(|t| line.starts_with(t));
-    if !is_type_decl {
-        return false;
-    }
-
-    if let Some(eq_pos) = line.find(" = ") {
-        let after_eq = &line[eq_pos + 3..];
-        return has_user_function_call(after_eq);
-    }
-
     false
-}
-
-/// Split `vec4 TRAIL_COLOR = vec4(func(...));` into
-/// `("vec4 TRAIL_COLOR;", "TRAIL_COLOR", "vec4(func(...))")`.
-fn split_global_declaration(line: &str) -> Option<(String, String, String)> {
-    let eq_pos = line.find(" = ")?;
-    let before_eq = line[..eq_pos].trim();
-    let after_eq = line[eq_pos + 3..].trim().trim_end_matches(';');
-
-    let var_name = before_eq.split_whitespace().last()?;
-    let decl_only = format!("{before_eq};");
-
-    Some((decl_only, var_name.to_string(), after_eq.to_string()))
 }
 
 #[cfg(test)]
@@ -756,71 +764,86 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_has_user_function_call_detects_user_func() {
-        assert!(has_user_function_call("vec4(sRGBToLinear(x.rgb), x.a)"));
-        assert!(has_user_function_call("myFunc(1.0)"));
-        assert!(has_user_function_call("vec4(customCalc(u.x), 0.0, 0.0, 1.0)"));
-    }
-
-    #[test]
-    fn test_has_user_function_call_ignores_builtins() {
-        assert!(!has_user_function_call("vec4(0.35, 0.36, 0.44, 1.0)"));
-        assert!(!has_user_function_call("vec4(mix(vec3(0.0), vec3(1.0), 0.5), 1.0)"));
-        assert!(!has_user_function_call("vec3(1.0, 2.0, 3.0)"));
-        assert!(!has_user_function_call("float(42)"));
-        assert!(!has_user_function_call("pow(2.0, 3.0)"));
-    }
-
-    #[test]
-    fn test_should_defer_global_trail_color() {
-        let line = "vec4 TRAIL_COLOR = vec4(sRGBToLinear(iCurrentCursorColor.rgb), iCurrentCursorColor.a);";
-        assert!(should_defer_global(line));
-    }
-
-    #[test]
-    fn test_should_not_defer_const_literal() {
-        let line = "vec4 COLOR = vec4(0.35, 0.36, 0.44, 1.0);";
-        assert!(!should_defer_global(line));
-    }
-
-    #[test]
-    fn test_should_not_defer_const_decl() {
-        let line = "const float DURATION = 0.2;";
-        assert!(!should_defer_global(line));
-    }
-
-    #[test]
-    fn test_preprocess_defers_trail_color() {
+    fn detects_classic_pattern() {
         let source = r#"vec3 sRGBToLinear(vec3 c) {
     return c;
 }
 
 vec4 TRAIL_COLOR = vec4(sRGBToLinear(iCurrentCursorColor.rgb), iCurrentCursorColor.a);
-const float DURATION = 0.2;
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     fragColor = TRAIL_COLOR;
 }
 "#;
-        let result = preprocess_shader_for_macos(source);
-        assert!(result.contains("vec4 TRAIL_COLOR;"));
-        assert!(!result.contains("vec4 TRAIL_COLOR = vec4(sRGBToLinear"));
-        assert!(result.contains("_alacritty_init_globals"));
-        assert!(result.contains(
-            "TRAIL_COLOR = vec4(sRGBToLinear(iCurrentCursorColor.rgb), iCurrentCursorColor.a)"
-        ));
-        assert!(result.contains("const float DURATION = 0.2;"));
+        assert_eq!(
+            detect_macos_unsafe_global(source).as_deref(),
+            Some("vec4 TRAIL_COLOR = vec4(sRGBToLinear(iCurrentCursorColor.rgb), iCurrentCursorColor.a)")
+        );
     }
 
     #[test]
-    fn test_preprocess_noop_safe_shader() {
+    fn detects_without_spaces_around_eq() {
+        let source = r#"float helper(float x) { return x; }
+float value=helper(1.0);
+"#;
+        assert!(detect_macos_unsafe_global(source).is_some());
+    }
+
+    #[test]
+    fn detects_multiline_initializer() {
+        let source = r#"float helper(float x) { return x; }
+float value =
+    helper(1.0);
+"#;
+        assert!(detect_macos_unsafe_global(source).is_some());
+    }
+
+    #[test]
+    fn detects_via_prototype() {
+        let source = r#"float helper(float x);
+float value = helper(1.0);
+float helper(float x) { return x; }
+"#;
+        assert!(detect_macos_unsafe_global(source).is_some());
+    }
+
+    #[test]
+    fn ignores_const_literal() {
         let source = r#"vec4 COLOR = vec4(0.35, 0.36, 0.44, 1.0);
+const float DURATION = 0.2;
 void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     fragColor = COLOR;
 }
 "#;
-        let result = preprocess_shader_for_macos(source);
-        assert!(result.contains("vec4 COLOR = vec4(0.35, 0.36, 0.44, 1.0);"));
-        assert!(result.contains("void _alacritty_init_globals() {\n}"));
+        assert_eq!(detect_macos_unsafe_global(source), None);
+    }
+
+    #[test]
+    fn ignores_builtin_calls() {
+        let source = r#"float X = pow(2.0, 3.0);
+vec3 Y = normalize(vec3(X));
+"#;
+        assert_eq!(detect_macos_unsafe_global(source), None);
+    }
+
+    #[test]
+    fn comment_braces_do_not_pollute_scope() {
+        let source = r#"// { not a scope
+float helper(float x) { return x; } // }
+float value = helper(1.0);
+"#;
+        assert!(detect_macos_unsafe_global(source).is_some());
+    }
+
+    #[test]
+    fn usage_inside_function_body_is_fine() {
+        let source = r#"float helper(float x) { return x; }
+float value;
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    value = helper(1.0);
+    fragColor = vec4(value);
+}
+"#;
+        assert_eq!(detect_macos_unsafe_global(source), None);
     }
 }

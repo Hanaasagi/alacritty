@@ -44,5 +44,4 @@ uniform sampler2D iChannel0;
 out vec4 _fragColor;
 
 void mainImage(out vec4 fragColor, in vec2 fragCoord);
-void _alacritty_init_globals();
-void main() { _alacritty_init_globals(); mainImage(_fragColor, gl_FragCoord.xy); }
+void main() { mainImage(_fragColor, gl_FragCoord.xy); }
