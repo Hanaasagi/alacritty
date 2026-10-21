@@ -1975,6 +1975,10 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     WindowEvent::ModifiersChanged(modifiers) => self.modifiers_input(modifiers),
                     WindowEvent::MouseInput { state, button, .. } => {
                         self.ctx.window().set_mouse_visible(true);
+                        // ShaderToy `iMouse` zw: click position, negated on release.
+                        if button == MouseButton::Left {
+                            self.ctx.display.update_mouse_click(state == ElementState::Pressed);
+                        }
                         self.mouse_input(state, button);
                     },
                     WindowEvent::CursorMoved { position, .. } => {
@@ -2019,6 +2023,10 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     },
                     WindowEvent::CursorLeft { .. } => {
                         self.ctx.mouse.inside_text_area = false;
+
+                        // Move the shader mouse position offscreen so effects driven by
+                        // iMouse.xy (e.g. hover glow) don't freeze at the exit point.
+                        self.ctx.display().clear_mouse_position();
 
                         if self.ctx.display().highlighted_hint.is_some() {
                             *self.ctx.dirty = true;
