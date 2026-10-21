@@ -178,19 +178,7 @@ impl Renderer {
             }
         }
 
-        let post_process = if use_glsl3 {
-            match PostProcessState::new() {
-                Ok(pp) => Some(pp),
-                Err(e) => {
-                    warn!("Failed to initialize post-processing: {e}");
-                    None
-                },
-            }
-        } else {
-            None
-        };
-
-        Ok(Self { text_renderer, rect_renderer, robustness, post_process })
+        Ok(Self { text_renderer, rect_renderer, robustness, post_process: None })
     }
 
     pub fn draw_cells<I: Iterator<Item = RenderableCell>>(
@@ -358,17 +346,20 @@ impl Renderer {
         }
     }
 
-    /// Bind the post-process FBO when available so rendering targets an offscreen texture.
-    pub fn bind_post_process_fbo(&self) {
-        if let Some(pp) = &self.post_process {
+    /// Bind the post-process FBO when a custom shader is loaded, so rendering targets an
+    /// offscreen texture.
+    pub fn bind_post_process_fbo(&mut self, size_info: &SizeInfo) {
+        if let Some(pp) = &mut self.post_process {
+            pp.resize(size_info.width() as u32, size_info.height() as u32);
             pp.bind_fbo();
         }
     }
 
     /// Run the post-process pass, blitting the offscreen texture to the default framebuffer.
     pub fn draw_post_process(&mut self, width: u32, height: u32, uniforms: &ShaderUniformValues) {
-        if let Some(pp) = &self.post_process {
-            pp.draw(width, height, uniforms);
+        match self.post_process.as_ref().filter(|pp| pp.has_custom_shader()) {
+            Some(pp) => pp.draw(width, height, uniforms),
+            None => return,
         }
         // The post-process pass may change texture bindings on unit 0 (e.g.
         // during context restore or driver quirks).  Invalidate the text
@@ -376,61 +367,49 @@ impl Renderer {
         self.invalidate_text_texture_cache();
     }
 
-    /// Compile a custom post-process shader from GLSL source (e.g. built-in shaders).
-    #[allow(dead_code)]
-    pub fn load_shader_from_source(&mut self, source: &str) -> Result<(), String> {
-        if let Some(pp) = &mut self.post_process {
-            pp.load_shader_from_source(source)
-        } else {
-            Err("Post-processing is not available".to_owned())
-        }
-    }
-
     /// Load post-process shaders from files and/or in-memory GLSL source.
+    ///
+    /// The post-process state is created lazily on first use and dropped again when no shader
+    /// remains loaded, so terminals without custom shaders have zero overhead.
     pub fn load_shaders(
         &mut self,
         entries: &[post_process::ShaderEntry],
     ) -> Vec<(std::path::PathBuf, String)> {
-        if let Some(pp) = &mut self.post_process {
-            pp.load_shaders(entries)
-        } else {
-            entries
-                .iter()
-                .map(|entry| {
-                    let label = match entry {
-                        post_process::ShaderEntry::File(path) => path.clone(),
-                        post_process::ShaderEntry::Source { label, .. } => label.clone(),
-                    };
-                    (label, "Post-processing is not available".to_owned())
-                })
-                .collect()
+        if entries.is_empty() {
+            self.post_process = None;
+            return Vec::new();
         }
-    }
 
-    /// Load multiple custom post-process shaders from the filesystem.
-    #[allow(dead_code)]
-    pub fn load_custom_shaders(
-        &mut self,
-        paths: &[std::path::PathBuf],
-    ) -> Vec<(std::path::PathBuf, String)> {
-        if let Some(pp) = &mut self.post_process {
-            pp.load_custom_shaders(paths)
-        } else {
-            paths
-                .iter()
-                .map(|p| (p.clone(), "Post-processing is not available".to_owned()))
-                .collect()
-        }
-    }
+        if self.post_process.is_none() {
+            // Post-process shaders require GLSL 3.3.
+            if !matches!(self.text_renderer, TextRendererProvider::Glsl3(_)) {
+                return entries
+                    .iter()
+                    .map(|entry| (entry.label().to_owned(), "GLSL3 renderer required".to_owned()))
+                    .collect();
+            }
+            match PostProcessState::new() {
+                Ok(pp) => self.post_process = Some(pp),
+                Err(e) => {
+                    warn!("Failed to initialize post-processing: {e}");
+                    return entries
+                        .iter()
+                        .map(|entry| (entry.label().to_owned(), e.to_string()))
+                        .collect();
+                },
+            }
 
-    /// Load a single custom post-process shader (backward-compatible wrapper).
-    #[allow(dead_code)]
-    pub fn load_custom_shader(&mut self, path: &std::path::Path) -> Result<(), String> {
-        if let Some(pp) = &mut self.post_process {
-            pp.load_custom_shader(path)
-        } else {
-            Err("Post-processing is not available".to_owned())
+            // PostProcessState::new() may have disturbed texture unit state.
+            // Ensure the text renderer re-binds its glyph atlas on the next frame.
+            self.invalidate_text_texture_cache();
         }
+
+        let pp = self.post_process.as_mut().unwrap();
+        let errors = pp.load_shaders(entries);
+        if !pp.has_custom_shader() {
+            self.post_process = None;
+        }
+        errors
     }
 
     /// Whether a custom post-process shader is loaded.
@@ -438,11 +417,9 @@ impl Renderer {
         self.post_process.as_ref().is_some_and(PostProcessState::has_custom_shader)
     }
 
-    /// Clear the loaded custom post-process shader.
+    /// Clear the loaded custom post-process shaders, releasing the FBO resources.
     pub fn clear_custom_shader(&mut self) {
-        if let Some(pp) = &mut self.post_process {
-            pp.clear_custom_shader();
-        }
+        self.post_process = None;
     }
 
     /// Resize the renderer.

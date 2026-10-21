@@ -1988,14 +1988,10 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     WindowEvent::Touch(touch) => self.touch(touch),
                     WindowEvent::Focused(is_focused) => {
                         self.ctx.terminal.is_focused = is_focused;
-                        if self.ctx.display.set_shader_focus(is_focused) {
-                            if self
-                                .ctx
-                                .display
-                                .handle_shader_focus_change(self.ctx.config, self.ctx.scheduler)
-                            {
-                                *self.ctx.dirty = true;
-                            }
+                        if self.ctx.display.set_shader_focus(is_focused)
+                            && self.ctx.display.handle_shader_focus_change()
+                        {
+                            *self.ctx.dirty = true;
                         }
 
                         // When the unfocused hollow is used we must redraw on focus change.
