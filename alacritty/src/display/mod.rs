@@ -7,7 +7,7 @@ use std::mem::{self, ManuallyDrop};
 use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use glutin::config::GetGlConfig;
 use glutin::context::{NotCurrentContext, PossiblyCurrentContext};
@@ -594,6 +594,24 @@ impl Display {
         self.shader_mouse[1] = self.size_info.height() - y_winit;
     }
 
+    /// Move the shader mouse position far offscreen (cursor left the window).
+    pub fn clear_mouse_position(&mut self) {
+        self.shader_mouse[0] = -65536.0;
+        self.shader_mouse[1] = -65536.0;
+    }
+
+    /// Update mouse click state for post-process shader uniforms (ShaderToy `iMouse` zw):
+    /// click position while pressed, negated on release.
+    pub fn update_mouse_click(&mut self, pressed: bool) {
+        if pressed {
+            self.shader_mouse[2] = self.shader_mouse[0];
+            self.shader_mouse[3] = self.shader_mouse[1];
+        } else {
+            self.shader_mouse[2] = -self.shader_mouse[2].abs();
+            self.shader_mouse[3] = -self.shader_mouse[3].abs();
+        }
+    }
+
     /// Update shader focus state when the window gains or loses focus.
     ///
     /// Returns `true` if the focus state changed.
@@ -898,10 +916,40 @@ impl Display {
         let display_offset = content.display_offset();
         let cursor = content.cursor();
 
+        // Foreground color of the cell under the cursor (ShaderToy `iCursorText`).
+        let cursor_text = if has_custom_shader {
+            grid_cells
+                .iter()
+                .find(|cell| cell.point == cursor.point())
+                .map(|cell| rgb_to_f32(cell.fg))
+                .unwrap_or([0.0; 3])
+        } else {
+            [0.0; 3]
+        };
+
+        // Cursor color exposed to shaders (iCurrentCursorColor).
+        //
+        // Two options:
+        //
+        // `cursor.color()` resolves `CellForeground` against the cell under the cursor,
+        // so the shader's cursor effect color follows the color of the character beneath
+        // it (e.g. syntax-highlighted text tints the trail while moving across it):
+        //
+        // let shader_cursor_color = cursor.color();
+        //
+        // Resolving `colors.cursor.background` against the primary colors only keeps the
+        // effect color stable regardless of the underlying text:
+        let cursor_config = if terminal.mode().contains(TermMode::VI) {
+            config.colors.vi_mode_cursor
+        } else {
+            config.colors.cursor
+        };
+        let shader_cursor_color = cursor_config.background.color(foreground_color, background_color);
+
         let cursor_changed = self.cursor_tracker.update(
             cursor.point(),
             cursor.shape(),
-            cursor.color(),
+            shader_cursor_color,
             cursor.width().get(),
             &self.size_info,
             self.shader_start_time,
@@ -1201,13 +1249,15 @@ impl Display {
                 background_color: rgb_to_f32(background_color),
                 foreground_color: rgb_to_f32(foreground_color),
                 cursor_color_rgb: [current.color[0], current.color[1], current.color[2]],
-                cursor_text: [0.0, 0.0, 0.0],
-                selection_fg_color: [1.0, 1.0, 1.0],
-                selection_bg_color: [0.3, 0.3, 0.8],
-                sample_rate: 0.0,
-                date: [0.0; 4],
+                cursor_text,
+                selection_fg_color: rgb_to_f32(
+                    config.colors.selection.foreground.color(foreground_color, background_color),
+                ),
+                selection_bg_color: rgb_to_f32(
+                    config.colors.selection.background.color(foreground_color, background_color),
+                ),
+                date: date_uniform(),
                 channel_resolution: [resolution, [0.0; 3], [0.0; 3], [0.0; 3]],
-                channel_time: [0.0; 4],
                 palette,
             };
 
@@ -1880,14 +1930,38 @@ impl FrameTimer {
     }
 }
 
-/// Calculate the cell dimensions based on font metrics.
-///
-/// This will return a tuple of the cell width and height.
+/// Convert an 8-bit RGB color to normalized float components.
 #[inline]
 fn rgb_to_f32(color: Rgb) -> [f32; 3] {
     [f32::from(color.r) / 255.0, f32::from(color.g) / 255.0, f32::from(color.b) / 255.0]
 }
 
+/// ShaderToy `iDate` uniform: (year, 0-based month, day, seconds since midnight), UTC.
+fn date_uniform() -> [f32; 4] {
+    let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = dur.as_secs();
+    let secs_today = (secs % 86_400) as f32 + dur.subsec_millis() as f32 / 1000.0;
+
+    let (year, month, day) = civil_from_days(secs as i64 / 86_400);
+    [year as f32, (month - 1) as f32, day as f32, secs_today]
+}
+
+/// Days since Unix epoch to (year, 1-based month, day); Howard Hinnant's algorithm.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(month <= 2), month, day)
+}
+
+/// Calculate the cell dimensions based on font metrics.
+///
+/// This will return a tuple of the cell width and height.
 fn compute_cell_size(config: &UiConfig, metrics: &crossfont::Metrics) -> (f32, f32) {
     let offset_x = f64::from(config.font.offset.x);
     let offset_y = f64::from(config.font.offset.y);
@@ -1914,4 +1988,16 @@ fn window_size(
     let height = (padding.1).mul_add(2., grid_height).floor();
 
     PhysicalSize::new(width as u32, height as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_from_days() {
+        assert_eq!(super::civil_from_days(0), (1970, 1, 1));
+        assert_eq!(super::civil_from_days(19_782), (2024, 2, 29));
+        assert_eq!(super::civil_from_days(-365), (1969, 1, 1));
+    }
 }
