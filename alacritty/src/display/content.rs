@@ -5,7 +5,6 @@ use std::ops::Deref;
 use std::{cmp, mem};
 
 use alacritty_terminal::event::EventListener;
-use alacritty_terminal::graphics::Image;
 use alacritty_terminal::graphics::placement::{Placement, PlacementLocation};
 use alacritty_terminal::graphics::unicode_placeholder::{
     PlaceholderCell, VirtualPlacementInfo, fragment_index_from_diacritic, image_id_from_fg_color,
@@ -28,21 +27,19 @@ use crate::event::SearchState;
 /// Minimum contrast between a fixed cursor color and the cell's background.
 pub const MIN_CURSOR_CONTRAST: f64 = 1.5;
 
-/// GPU-ready Kitty graphics placement.
+/// GPU-ready Kitty graphics placement, in viewport pixels (padding included).
 #[derive(Debug, Clone)]
 pub struct RenderableImagePlacement {
     pub image_id: u32,
-    pub viewport_row: usize,
-    pub viewport_col: usize,
-    pub display_cols: u32,
-    pub display_rows: u32,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
     pub z_index: i32,
     pub source_x: u32,
     pub source_y: u32,
     pub source_width: u32,
     pub source_height: u32,
-    pub x_offset: u32,
-    pub y_offset: u32,
 }
 
 /// Pixel data and placements for one frame of Kitty graphics rendering.
@@ -135,111 +132,103 @@ fn resolve_and_clip<T: EventListener>(
     size_info: &SizeInfo,
     term: &Term<T>,
 ) -> Option<RenderableImagePlacement> {
-    let image = term.graphics_state.storage.get_image(placement.image_id)?;
     let cell_w = size_info.cell_width();
     let cell_h = size_info.cell_height();
 
-    let (grid_row, grid_col, display_cols, display_rows): (i32, usize, u32, u32) =
+    // Anchor cell and requested size in cells (0 = auto-size from pixels).
+    let (grid_row, grid_col, columns, rows): (i32, usize, u32, u32) =
         if placement.virtual_placement {
             let info = virtual_infos.get(&(placement.image_id, placement.placement_id))?;
-            let cols = if placement.columns != 0 {
-                placement.columns
-            } else {
-                info.cols as u32
-            };
-            let rows = if placement.rows != 0 {
-                placement.rows
-            } else {
-                info.rows as u32
-            };
+            let cols = if placement.columns != 0 { placement.columns } else { info.cols as u32 };
+            let rows = if placement.rows != 0 { placement.rows } else { info.rows as u32 };
             (info.start_row, info.start_col, cols, rows)
         } else {
             let PlacementLocation::Pin { row, col } = placement.location else {
                 return None;
             };
-            let cols = if placement.columns != 0 {
-                placement.columns
-            } else {
-                auto_display_cols(placement, image, cell_w)
-            };
-            let rows = if placement.rows != 0 {
-                placement.rows
-            } else {
-                auto_display_rows(placement, image, cell_h)
-            };
-            (row, col, cols, rows)
+            (row, col, placement.columns, placement.rows)
         };
-
-    if display_cols == 0 || display_rows == 0 {
-        return None;
-    }
-
-    // Signed viewport coordinates (can be negative = above viewport).
-    let vp_row = grid_row + display_offset as i32;
-    let vp_col = grid_col as i32;
-
-    let screen_lines = size_info.screen_lines() as i32;
-    let columns = size_info.columns() as i32;
-
-    // Rectangle intersection with viewport [0, screen_lines) × [0, columns).
-    let img_top = vp_row;
-    let img_bot = vp_row + display_rows as i32;
-    let img_left = vp_col;
-    let img_right = vp_col + display_cols as i32;
-
-    let vis_top = img_top.max(0);
-    let vis_bot = img_bot.min(screen_lines);
-    let vis_left = img_left.max(0);
-    let vis_right = img_right.min(columns);
-
-    if vis_top >= vis_bot || vis_left >= vis_right {
-        return None;
-    }
-
-    // How many grid cells are clipped from each edge.
-    let skip_top = (vis_top - img_top) as u32;
-    let skip_left = (vis_left - img_left) as u32;
-    let vis_rows = (vis_bot - vis_top) as u32;
-    let vis_cols = (vis_right - vis_left) as u32;
 
     // Resolve full source dimensions.
     let full_src_w = resolve_source_dimension(placement.source_width, placement, term, true);
     let full_src_h = resolve_source_dimension(placement.source_height, placement, term, false);
+    if full_src_w == 0 || full_src_h == 0 {
+        return None;
+    }
 
-    // Adjust source rectangle for clipping (linear mapping).
-    let src_x = placement.source_x + skip_left * full_src_w / display_cols;
-    let src_y = placement.source_y + skip_top * full_src_h / display_rows;
-    let src_w = vis_cols * full_src_w / display_cols;
-    let src_h = vis_rows * full_src_h / display_rows;
+    // Display size in pixels. Auto-sized dimensions keep the image's pixel
+    // size (or scale proportionally when only one cell dimension is given)
+    // instead of stretching to the cell-rounded rectangle.
+    let (w_px, h_px) =
+        auto_display_size_px(columns, rows, full_src_w, full_src_h, cell_w, cell_h);
+    if w_px <= 0.0 || h_px <= 0.0 {
+        return None;
+    }
 
-    // Pixel offsets: only apply if the corresponding edge is not clipped.
-    let x_offset = if skip_left == 0 { placement.x_offset } else { 0 };
-    let y_offset = if skip_top == 0 { placement.y_offset } else { 0 };
+    // Image origin in viewport pixels (padding included).
+    let vp_row = grid_row + display_offset as i32;
+    let origin_x = size_info.padding_x() + grid_col as f32 * cell_w + placement.x_offset as f32;
+    let origin_y = size_info.padding_y() + vp_row as f32 * cell_h + placement.y_offset as f32;
+
+    // Clip against the grid area in pixels.
+    let area_left = size_info.padding_x();
+    let area_top = size_info.padding_y();
+    let area_right = area_left + size_info.columns() as f32 * cell_w;
+    let area_bottom = area_top + size_info.screen_lines() as f32 * cell_h;
+
+    let left = origin_x.max(area_left);
+    let top = origin_y.max(area_top);
+    let right = (origin_x + w_px).min(area_right);
+    let bottom = (origin_y + h_px).min(area_bottom);
+    if left >= right || top >= bottom {
+        return None;
+    }
+
+    // Map the clipped rectangle back into source pixels (proportional).
+    let src_x = placement.source_x as f32 + (left - origin_x) * full_src_w as f32 / w_px;
+    let src_y = placement.source_y as f32 + (top - origin_y) * full_src_h as f32 / h_px;
+    let src_w = (right - left) * full_src_w as f32 / w_px;
+    let src_h = (bottom - top) * full_src_h as f32 / h_px;
 
     Some(RenderableImagePlacement {
         image_id: placement.image_id,
-        viewport_row: vis_top as usize,
-        viewport_col: vis_left as usize,
-        display_cols: vis_cols,
-        display_rows: vis_rows,
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
         z_index: placement.z_index,
-        source_x: src_x,
-        source_y: src_y,
-        source_width: src_w,
-        source_height: src_h,
-        x_offset,
-        y_offset,
+        source_x: src_x as u32,
+        source_y: src_y as u32,
+        source_width: (src_w as u32).max(1),
+        source_height: (src_h as u32).max(1),
     })
 }
 
-fn auto_display_cols(placement: &Placement, image: &Image, cell_w: f32) -> u32 {
-    let src_w = if placement.source_width != 0 { placement.source_width } else { image.width };
-    ((src_w as f32 / cell_w).ceil() as u32).max(1)
-}
-
-fn auto_display_rows(placement: &Placement, image: &Image, cell_h: f32) -> u32 {
-    let src_h = if placement.source_height != 0 { placement.source_height } else { image.height };
-    ((src_h as f32 / cell_h).ceil() as u32).max(1)
+/// Display size in pixels for a placement, following kitty's layout rules:
+/// both dimensions unset keeps the image's pixel size, one dimension set
+/// scales the other proportionally, and both set stretches exactly.
+fn auto_display_size_px(
+    columns: u32,
+    rows: u32,
+    src_w: u32,
+    src_h: u32,
+    cell_w: f32,
+    cell_h: f32,
+) -> (f32, f32) {
+    let src_w = src_w.max(1) as f32;
+    let src_h = src_h.max(1) as f32;
+    match (columns, rows) {
+        (0, 0) => (src_w, src_h),
+        (c, 0) => {
+            let w = c as f32 * cell_w;
+            (w, w * src_h / src_w)
+        },
+        (0, r) => {
+            let h = r as f32 * cell_h;
+            (h * src_w / src_h, h)
+        },
+        (c, r) => (c as f32 * cell_w, r as f32 * cell_h),
+    }
 }
 
 fn collect_virtual_placement_infos<T: EventListener>(
@@ -836,5 +825,29 @@ impl Deref for HintMatches<'_> {
 
     fn deref(&self) -> &Self::Target {
         self.matches.deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auto_display_size_px;
+
+    #[test]
+    fn auto_size_keeps_pixel_dimensions() {
+        // 100x50 image on 10x20 cells: native pixel size, no cell-rounding stretch.
+        assert_eq!(auto_display_size_px(0, 0, 100, 50, 10.0, 20.0), (100.0, 50.0));
+    }
+
+    #[test]
+    fn auto_size_scales_proportionally_with_one_dimension() {
+        // Only columns given: height scales by aspect ratio.
+        assert_eq!(auto_display_size_px(5, 0, 100, 50, 10.0, 20.0), (50.0, 25.0));
+        // Only rows given: width scales by aspect ratio.
+        assert_eq!(auto_display_size_px(0, 4, 100, 50, 10.0, 20.0), (160.0, 80.0));
+    }
+
+    #[test]
+    fn auto_size_explicit_stretches() {
+        assert_eq!(auto_display_size_px(5, 4, 100, 50, 10.0, 20.0), (50.0, 80.0));
     }
 }
