@@ -17,6 +17,8 @@ serde = ["dep:serde", "bitflags/serde", "vte/serde"]
 [dependencies]
 arrayvec = { version = "0.7.2", features = ["serde"] }
 base64 = "0.22.0"
+flate2 = { version = "1.0", default-features = false, features = ["zlib"] }
+png = { version = "0.17.5", default-features = false }
 bitflags = "2.4.1"
 home = "0.5.5"
 libc = "0.2"
