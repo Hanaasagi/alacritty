@@ -46,7 +46,7 @@ use crate::config::window::Dimensions;
 use crate::config::window::StartupMode;
 use crate::display::bell::VisualBell;
 use crate::display::color::{List, Rgb};
-use crate::display::content::{RenderableContent, RenderableCursor};
+use crate::display::content::{RenderableContent, RenderableCursor, RenderableGraphics};
 use crate::display::cursor::IntoRects;
 use crate::display::cursor_state::CursorTracker;
 use crate::display::damage::{DamageTracker, damage_y_to_viewport_y};
@@ -977,6 +977,25 @@ impl Display {
         let metrics = self.glyph_cache.font_metrics();
         let size_info = self.size_info;
 
+        let mut graphics =
+            RenderableGraphics::collect(&terminal, display_offset, &size_info);
+
+        // If a previously off-viewport image has become visible again but its GPU
+        // texture was evicted, force a re-upload from terminal storage.
+        if !graphics.sync_to_gpu && self.renderer.needs_graphics_reupload(&graphics) {
+            terminal.graphics_state.dirty = true;
+            graphics = RenderableGraphics::collect(&terminal, display_offset, &size_info);
+        }
+
+        if graphics.sync_to_gpu {
+            terminal.graphics_state.dirty = false;
+        }
+
+        if graphics.sync_to_gpu || !graphics.placements.is_empty() {
+            self.damage_tracker.frame().mark_fully_damaged();
+            self.damage_tracker.next_frame().mark_fully_damaged();
+        }
+
         let vi_mode = terminal.mode().contains(TermMode::VI);
         let vi_cursor_point = if vi_mode { Some(terminal.vi_mode_cursor.point) } else { None };
 
@@ -1026,6 +1045,12 @@ impl Display {
         self.renderer.bind_post_process_fbo(&self.size_info);
 
         self.renderer.clear(background_color, config.window_opacity());
+
+        self.renderer.sync_image_textures(&graphics);
+        if !graphics.placements.is_empty() {
+            self.renderer.draw_images_below(&size_info, &graphics);
+        }
+
         let mut lines = RenderLines::new();
 
         // Optimize loop hint comparator.
@@ -1066,6 +1091,10 @@ impl Display {
                 cell
             });
             self.renderer.draw_cells(&size_info, glyph_cache, cells);
+        }
+
+        if !graphics.placements.is_empty() {
+            self.renderer.draw_images_above(&size_info, &graphics);
         }
 
         let mut rects = lines.rects(&metrics, &size_info);

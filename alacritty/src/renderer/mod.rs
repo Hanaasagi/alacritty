@@ -25,6 +25,7 @@ use crate::renderer::rects::{RectRenderer, RenderRect};
 use crate::renderer::shader::ShaderError;
 
 mod builtin_shaders;
+mod image;
 pub mod platform;
 mod post_process;
 pub mod rects;
@@ -36,8 +37,11 @@ pub use builtin_shaders::get_builtin_shader;
 pub use post_process::{ShaderEntry, ShaderUniformValues};
 pub use text::{GlyphCache, LoaderApi};
 
+use image::ImageRenderer;
 use shader::ShaderVersion;
 use text::{Gles2Renderer, Glsl3Renderer, TextRenderer};
+
+use crate::display::content::{RenderableGraphics, RenderableImagePlacement};
 
 /// Whether the OpenGL functions have been loaded.
 pub static GL_FUNS_LOADED: AtomicBool = AtomicBool::new(false);
@@ -95,6 +99,7 @@ enum TextRendererProvider {
 pub struct Renderer {
     text_renderer: TextRendererProvider,
     rect_renderer: RectRenderer,
+    image_renderer: ImageRenderer,
     robustness: bool,
     post_process: Option<PostProcessState>,
 }
@@ -157,6 +162,8 @@ impl Renderer {
             None => (shader_version.as_ref() >= "3.3" && !is_gles_context, true),
         };
 
+        let shader_version = if use_glsl3 { ShaderVersion::Glsl3 } else { ShaderVersion::Gles2 };
+
         let (text_renderer, rect_renderer) = if use_glsl3 {
             let text_renderer = TextRendererProvider::Glsl3(Glsl3Renderer::new()?);
             let rect_renderer = RectRenderer::new(ShaderVersion::Glsl3)?;
@@ -168,6 +175,8 @@ impl Renderer {
             (text_renderer, rect_renderer)
         };
 
+        let image_renderer = ImageRenderer::new(shader_version)?;
+
         // Enable debug logging for OpenGL as well.
         if log::max_level() >= LevelFilter::Debug && GlExtensions::contains("GL_KHR_debug") {
             debug!("Enabled debug logging for OpenGL");
@@ -178,7 +187,98 @@ impl Renderer {
             }
         }
 
-        Ok(Self { text_renderer, rect_renderer, robustness, post_process: None })
+        Ok(Self { text_renderer, rect_renderer, image_renderer, robustness, post_process: None })
+    }
+
+    /// Upload textures and clean up stale ones. Call once per frame.
+    pub fn sync_image_textures(&mut self, graphics: &RenderableGraphics) {
+        if graphics.sync_to_gpu {
+            for (&image_id, image) in &graphics.images {
+                self.image_renderer.upload_image(image_id, image.width, image.height, &image.data);
+            }
+        }
+
+        // Clean up textures for images no longer in ANY placement (including off-viewport).
+        self.image_renderer.cleanup_unused(&graphics.all_image_ids);
+    }
+
+    /// Check if any visible placement is missing its GPU texture (e.g. after
+    /// a display-offset scroll that made a previously off-screen image visible
+    /// again while its texture had been evicted).
+    pub fn needs_graphics_reupload(&self, graphics: &RenderableGraphics) -> bool {
+        graphics
+            .placements
+            .iter()
+            .any(|p| !self.image_renderer.has_texture(p.image_id))
+    }
+
+    /// Draw Kitty graphics images below the text layer (`z_index < 0`).
+    pub fn draw_images_below(&mut self, size_info: &SizeInfo, graphics: &RenderableGraphics) {
+        self.draw_images(size_info, graphics, |z| z < 0);
+    }
+
+    /// Draw Kitty graphics images above the text layer (`z_index >= 0`).
+    pub fn draw_images_above(&mut self, size_info: &SizeInfo, graphics: &RenderableGraphics) {
+        self.draw_images(size_info, graphics, |z| z >= 0);
+    }
+
+    fn draw_images(
+        &mut self,
+        size_info: &SizeInfo,
+        graphics: &RenderableGraphics,
+        z_filter: impl Fn(i32) -> bool,
+    ) {
+        if graphics.placements.is_empty() {
+            return;
+        }
+
+        let mut placements: Vec<&RenderableImagePlacement> =
+            graphics.placements.iter().filter(|p| z_filter(p.z_index)).collect();
+        if placements.is_empty() {
+            return;
+        }
+        placements.sort_by_key(|p| p.z_index);
+
+        unsafe {
+            // Use full-window viewport for pixel-based NDC conversion.
+            gl::Viewport(0, 0, size_info.width() as i32, size_info.height() as i32);
+            gl::Enable(gl::BLEND);
+            gl::BlendFuncSeparate(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA, gl::ONE, gl::ONE_MINUS_SRC_ALPHA);
+        }
+
+        for placement in placements {
+            let x = size_info.padding_x()
+                + placement.viewport_col as f32 * size_info.cell_width()
+                + placement.x_offset as f32;
+            let y = size_info.padding_y()
+                + placement.viewport_row as f32 * size_info.cell_height()
+                + placement.y_offset as f32;
+            let width = placement.display_cols as f32 * size_info.cell_width();
+            let height = placement.display_rows as f32 * size_info.cell_height();
+
+            let source_rect = Some([
+                placement.source_x as f32,
+                placement.source_y as f32,
+                placement.source_width as f32,
+                placement.source_height as f32,
+            ]);
+
+            self.image_renderer.draw_image(
+                placement.image_id,
+                x,
+                y,
+                width,
+                height,
+                source_rect,
+                size_info,
+            );
+        }
+
+        unsafe {
+            gl::BlendFunc(gl::SRC1_COLOR, gl::ONE_MINUS_SRC1_COLOR);
+            // Restore padded viewport.
+            self.set_viewport(size_info);
+        }
     }
 
     pub fn draw_cells<I: Iterator<Item = RenderableCell>>(
