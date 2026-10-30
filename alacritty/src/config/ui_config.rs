@@ -29,6 +29,7 @@ use crate::config::cursor::Cursor;
 use crate::config::debug::Debug;
 use crate::config::font::Font;
 use crate::config::general::General;
+use crate::config::graphics::GraphicsConfig;
 use crate::config::mouse::Mouse;
 use crate::config::scrolling::Scrolling;
 use crate::config::selection::Selection;
@@ -72,6 +73,9 @@ pub struct UiConfig {
 
     /// Custom shader configuration.
     pub shader: ShaderConfig,
+
+    /// Kitty graphics protocol configuration.
+    pub graphics: GraphicsConfig,
 
     /// Bell configuration.
     pub bell: BellConfig,
@@ -128,6 +132,8 @@ impl UiConfig {
             default_cursor_style: self.cursor.style(),
             osc52: self.terminal.osc52.0,
             kitty_keyboard: true,
+            kitty_graphics: self.graphics.enabled(),
+            graphics_max_memory: self.graphics.max_memory.0,
         }
     }
 
