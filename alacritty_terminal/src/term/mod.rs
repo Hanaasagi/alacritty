@@ -14,6 +14,8 @@ use log::{debug, trace};
 use unicode_width::UnicodeWidthChar;
 
 use crate::event::{Event, EventListener};
+use crate::graphics::placement::{Placement, PlacementLocation};
+use crate::graphics::{exec, GraphicsState};
 use crate::grid::{Dimensions, Grid, GridIterator, Scroll};
 use crate::index::{self, Boundary, Column, Direction, Line, Point, Side};
 use crate::selection::{Selection, SelectionRange, SelectionType};
@@ -327,6 +329,13 @@ pub struct Term<T> {
 
     /// Config directly for the terminal.
     config: Config,
+
+    /// Kitty graphics protocol state.
+    pub graphics_state: GraphicsState,
+
+    /// Graphics placements belonging to the inactive screen buffer.
+    /// Swapped with `graphics_state.placements` by [`Term::swap_alt`].
+    inactive_graphics_placements: Vec<Placement>,
 }
 
 /// Configuration options for the [`Term`].
@@ -349,6 +358,12 @@ pub struct Config {
     /// Whether to enable kitty keyboard protocol.
     pub kitty_keyboard: bool,
 
+    /// Whether to enable Kitty graphics protocol.
+    pub kitty_graphics: bool,
+
+    /// Maximum Kitty graphics image storage in MiB.
+    pub graphics_max_memory: u64,
+
     /// OSC52 support mode.
     pub osc52: Osc52,
 }
@@ -361,8 +376,17 @@ impl Default for Config {
             default_cursor_style: Default::default(),
             vi_mode_cursor_style: Default::default(),
             kitty_keyboard: Default::default(),
+            kitty_graphics: true,
+            graphics_max_memory: 320,
             osc52: Default::default(),
         }
+    }
+}
+
+impl Config {
+    #[inline]
+    fn graphics_max_memory_bytes(&self) -> usize {
+        self.graphics_max_memory.saturating_mul(1024 * 1024) as usize
     }
 }
 
@@ -421,6 +445,7 @@ impl<T> Term<T> {
 
         // Initialize terminal damage, covering the entire terminal upon launch.
         let damage = TermDamageState::new(num_cols, num_lines);
+        let graphics_state = GraphicsState::with_storage_limit(config.graphics_max_memory_bytes());
 
         Term {
             inactive_grid,
@@ -441,6 +466,8 @@ impl<T> Term<T> {
             selection: Default::default(),
             title: Default::default(),
             mode: Default::default(),
+            graphics_state,
+            inactive_graphics_placements: Vec::new(),
         }
     }
 
@@ -495,6 +522,101 @@ impl<T> Term<T> {
         self.damage.full = true;
     }
 
+    fn clear_graphics_placements(&mut self) {
+        let removed = std::mem::take(&mut self.graphics_state.placements);
+        for placement in removed {
+            self.graphics_state.storage.remove_reference(placement.image_id);
+        }
+        self.graphics_state.dirty = true;
+    }
+
+    /// Drop placements pinned in scrollback (negative rows), used by ED 3.
+    fn clear_scrollback_graphics_placements(&mut self) {
+        let mut removed_ids = Vec::new();
+        self.graphics_state.placements.retain(|placement| {
+            let keep =
+                !matches!(placement.location, PlacementLocation::Pin { row, .. } if row < 0);
+            if !keep {
+                removed_ids.push(placement.image_id);
+            }
+            keep
+        });
+        for id in removed_ids {
+            self.graphics_state.storage.remove_reference(id);
+        }
+        self.graphics_state.dirty = true;
+    }
+
+    fn adjust_graphics_placements_on_scroll(
+        &mut self,
+        scroll_start: usize,
+        scroll_end: usize,
+        scroll_amount: usize,
+        scroll_up: bool,
+    ) {
+        if scroll_amount == 0 {
+            return;
+        }
+
+        let scroll_start = scroll_start as i32;
+        let scroll_end = scroll_end as i32;
+        let scroll_amount = scroll_amount as i32;
+        let num_cols = self.columns();
+        let min_row = -(self.grid.history_size() as i32);
+
+        let mut removed_ids = Vec::new();
+
+        self.graphics_state.placements.retain_mut(|placement| {
+            let PlacementLocation::Pin { ref mut row, ref col } = placement.location else {
+                return true;
+            };
+
+            // When the region starts at the active-area top (scroll_start
+            // == 0) and we scroll up, ALL placements shift — including
+            // those already in scrollback — because Line coordinates are
+            // relative to the active-area top which moves on every
+            // ring-buffer rotation.
+            //
+            // Partial-region scroll (scroll_start > 0) or scroll-down:
+            // only placements inside [scroll_start, scroll_end) are
+            // adjusted; the grid only rotates lines within the region.
+            if scroll_up && scroll_start == 0 {
+                if *row >= scroll_end {
+                    return true;
+                }
+            } else if *row < scroll_start || *row >= scroll_end {
+                return true;
+            }
+
+            let keep = if scroll_up {
+                *row -= scroll_amount;
+                if *row < scroll_start {
+                    // Scrolled off the region top. Lines enter scrollback only
+                    // when the region starts at the screen top (Grid behavior);
+                    // otherwise the content is erased.
+                    scroll_start == 0 && *row >= min_row
+                } else {
+                    true
+                }
+            } else {
+                // Placements pushed past the region bottom are erased.
+                *row += scroll_amount;
+                *row < scroll_end
+            };
+
+            let keep = keep && *col < num_cols;
+            if !keep {
+                removed_ids.push(placement.image_id);
+            }
+            keep
+        });
+
+        for id in removed_ids {
+            self.graphics_state.storage.remove_reference(id);
+        }
+        self.graphics_state.dirty = true;
+    }
+
     /// Set new options for the [`Term`].
     pub fn set_options(&mut self, options: Config)
     where
@@ -519,6 +641,20 @@ impl<T> Term<T> {
             self.keyboard_mode_stack = Vec::new();
             self.inactive_keyboard_mode_stack = Vec::new();
             self.mode.remove(TermMode::KITTY_KEYBOARD_PROTOCOL);
+        }
+
+        if self.config.graphics_max_memory != old_config.graphics_max_memory {
+            self.graphics_state
+                .storage
+                .set_max_limit(self.config.graphics_max_memory_bytes());
+            self.graphics_state.dirty = true;
+        }
+
+        if !self.config.kitty_graphics && old_config.kitty_graphics {
+            self.clear_graphics_placements();
+            self.graphics_state.storage.delete(
+                &crate::graphics::DeleteAction::All { delete_data: true },
+            );
         }
 
         // Damage everything on config updates.
@@ -729,6 +865,8 @@ impl<T> Term<T> {
         self.set_keyboard_mode(keyboard_mode, KeyboardModesApplyBehavior::Replace);
 
         mem::swap(&mut self.grid, &mut self.inactive_grid);
+        mem::swap(&mut self.graphics_state.placements, &mut self.inactive_graphics_placements);
+        self.graphics_state.dirty = true;
         self.mode ^= TermMode::ALT_SCREEN;
         self.selection = None;
         self.mark_fully_damaged();
@@ -759,6 +897,12 @@ impl<T> Term<T> {
 
         // Scroll between origin and bottom
         self.grid.scroll_down(&region, lines);
+        self.adjust_graphics_placements_on_scroll(
+            origin.0 as usize,
+            region.end.0 as usize,
+            lines,
+            false,
+        );
         self.mark_fully_damaged();
     }
 
@@ -778,6 +922,12 @@ impl<T> Term<T> {
         self.selection = self.selection.take().and_then(|s| s.rotate(self, &region, lines as i32));
 
         self.grid.scroll_up(&region, lines);
+        self.adjust_graphics_placements_on_scroll(
+            origin.0 as usize,
+            region.end.0 as usize,
+            lines,
+            true,
+        );
 
         // Scroll vi mode cursor.
         let viewport_top = Line(-(self.grid.display_offset() as i32));
@@ -1439,6 +1589,81 @@ impl<T: EventListener> Handler for Term<T> {
         self.event_proxy.send_event(Event::Bell);
     }
 
+    fn apc_start(&mut self) {
+        self.graphics_state.parser.reset();
+    }
+
+    fn apc_put(&mut self, byte: u8) {
+        self.graphics_state.parser.feed(byte);
+    }
+
+    fn apc_end(&mut self)
+    where
+        T: EventListener,
+    {
+        if !self.config.kitty_graphics {
+            trace!("[kitty-graphics] APC ignored: graphics disabled");
+            self.graphics_state.parser.reset();
+            return;
+        }
+
+        let cmd = match self.graphics_state.parser.finish() {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                trace!("[kitty-graphics] APC parse error: {e}");
+                return;
+            },
+        };
+
+        trace!(
+            "[kitty-graphics] APC command: action={:?}, id={}, format={:?}, w={}, h={}, data_len={}",
+            cmd.action,
+            cmd.transmission.image_id,
+            cmd.transmission.format,
+            cmd.transmission.width,
+            cmd.transmission.height,
+            cmd.data.len(),
+        );
+
+        let cursor_row = self.grid.cursor.point.line.0;
+        let cursor_col = self.grid.cursor.point.column.0;
+
+        let result = exec::execute(
+            &cmd,
+            &mut self.graphics_state.storage,
+            &mut self.graphics_state.placements,
+            &mut self.graphics_state.loading,
+            cursor_row,
+            cursor_col,
+        );
+
+        // Move cursor down by the number of rows the image occupies. Clamp to
+        // the screen height: `r=` is client-controlled and each linefeed can
+        // scroll, so an unbounded value would hang the terminal.
+        if result.cursor_rows_to_move > 0 {
+            for _ in 0..result.cursor_rows_to_move.min(self.screen_lines()) {
+                self.linefeed();
+            }
+            self.carriage_return();
+        }
+
+        if let Some(ref response) = result.response {
+            trace!(
+                "[kitty-graphics] Response: {}",
+                String::from_utf8_lossy(response)
+            );
+            let text = String::from_utf8_lossy(response).into_owned();
+            self.event_proxy.send_event(Event::PtyWrite(text));
+        }
+
+        trace!(
+            "[kitty-graphics] State: {} placements, storage_bytes={}",
+            self.graphics_state.placements.len(),
+            self.graphics_state.storage.total_bytes(),
+        );
+        self.graphics_state.dirty = true;
+    }
+
     #[inline]
     fn substitute(&mut self) {
         trace!("[unimplemented] Substitute");
@@ -1814,6 +2039,12 @@ impl<T: EventListener> Handler for Term<T> {
             ansi::ClearMode::Saved => (),
         }
 
+        match mode {
+            ansi::ClearMode::All => self.clear_graphics_placements(),
+            ansi::ClearMode::Saved => self.clear_scrollback_graphics_placements(),
+            _ => {},
+        }
+
         self.mark_fully_damaged();
     }
 
@@ -1848,6 +2079,12 @@ impl<T: EventListener> Handler for Term<T> {
         self.vi_mode_cursor = Default::default();
         self.keyboard_mode_stack = Default::default();
         self.inactive_keyboard_mode_stack = Default::default();
+        self.clear_graphics_placements();
+        self.inactive_graphics_placements.clear();
+        self.graphics_state.loading = None;
+        self.graphics_state
+            .storage
+            .delete(&crate::graphics::DeleteAction::All { delete_data: true });
 
         // Preserve vi mode across resets.
         self.mode &= TermMode::VI;
@@ -3241,6 +3478,269 @@ mod tests {
         let size = TermSize::new(10, 10);
         term.resize(size);
         assert!(term.damage.full);
+    }
+
+    #[test]
+    fn graphics_placements_survive_alt_screen_roundtrip() {
+        let size = TermSize::new(10, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        term.graphics_state.placements.push(Placement { image_id: 1, ..Default::default() });
+
+        // Clearing the alt screen (e.g. vim's ED 2J after 1049h) must not touch
+        // primary-screen placements.
+        term.swap_alt();
+        term.clear_screen(ansi::ClearMode::All);
+        assert!(term.graphics_state.placements.is_empty());
+
+        term.swap_alt();
+        assert_eq!(term.graphics_state.placements.len(), 1);
+        assert_eq!(term.graphics_state.placements[0].image_id, 1);
+    }
+
+    #[test]
+    fn graphics_cleanup_on_ed3_and_reset() {
+        let size = TermSize::new(10, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        term.graphics_state.placements.push(Placement {
+            image_id: 1,
+            location: PlacementLocation::Pin { row: 0, col: 0 },
+            ..Default::default()
+        });
+        term.graphics_state.placements.push(Placement {
+            image_id: 2,
+            location: PlacementLocation::Pin { row: -1, col: 0 },
+            ..Default::default()
+        });
+
+        // ED 3 drops only scrollback-pinned placements.
+        term.clear_screen(ansi::ClearMode::Saved);
+        assert_eq!(term.graphics_state.placements.len(), 1);
+        assert_eq!(term.graphics_state.placements[0].image_id, 1);
+
+        // RIS drops placements and stored image data.
+        term.reset_state();
+        assert!(term.graphics_state.placements.is_empty());
+        assert_eq!(term.graphics_state.storage.total_bytes(), 0);
+    }
+
+    #[test]
+    fn graphics_clear_screen_releases_references() {
+        let size = TermSize::new(10, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        term.graphics_state.storage.add_image(crate::graphics::Image {
+            id: 1,
+            width: 1,
+            height: 1,
+            data: vec![0; 4],
+            image_number: 0,
+            implicit_id: false,
+        }).unwrap();
+        term.graphics_state.placements.push(Placement { image_id: 1, ..Default::default() });
+        term.graphics_state.storage.add_reference(1);
+
+        // After ED 2 the placement is gone and its storage reference released,
+        // so a data delete must fully remove the image record.
+        term.clear_screen(ansi::ClearMode::All);
+        term.graphics_state
+            .storage
+            .delete(&crate::graphics::DeleteAction::ById { image_id: 1, delete_data: true });
+        assert!(term.graphics_state.storage.get_image(1).is_none());
+    }
+
+    #[test]
+    fn kitty_graphics_apc_roundtrip() {
+        use base64::Engine;
+        let size = TermSize::new(10, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        // a=T with a 1x1 RGBA red pixel, explicit id, 2 rows / 3 columns.
+        let payload = base64::engine::general_purpose::STANDARD.encode([255u8, 0, 0, 255]);
+        let apc = format!("Ga=T,f=32,s=1,v=1,i=7,r=2,c=3;{payload}");
+        term.apc_start();
+        for byte in apc.bytes() {
+            term.apc_put(byte);
+        }
+        term.apc_end();
+
+        let image = term.graphics_state.storage.get_image(7).expect("image stored");
+        assert_eq!(&image.data, &[255, 0, 0, 255]);
+        assert_eq!(term.graphics_state.placements.len(), 1);
+        assert_eq!(term.graphics_state.placements[0].rows, 2);
+        // Cursor advanced by the placement's row count.
+        assert_eq!(term.renderable_content().cursor.point.line.0, 2);
+
+        // Scrolling moves the pinned row with its content, into scrollback.
+        term.scroll_up(1);
+        let PlacementLocation::Pin { row, .. } = term.graphics_state.placements[0].location
+        else {
+            panic!("expected pinned placement");
+        };
+        assert_eq!(row, -1);
+    }
+
+    #[test]
+    fn graphics_scroll_respects_region_bottom() {
+        let size = TermSize::new(10, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        // Scroll region rows 2..=6 (1-based) = Line(1)..Line(6).
+        term.set_scrolling_region(2, Some(6));
+        let pin = |row| Placement {
+            image_id: 1,
+            location: PlacementLocation::Pin { row, col: 0 },
+            ..Default::default()
+        };
+        term.graphics_state.placements.push(pin(1)); // inside, scrolled off the region top
+        term.graphics_state.placements.push(pin(3)); // inside, moves up
+        term.graphics_state.placements.push(pin(8)); // below the region, untouched
+
+        term.scroll_up(1);
+
+        let rows: Vec<i32> = term
+            .graphics_state
+            .placements
+            .iter()
+            .map(|p| match p.location {
+                PlacementLocation::Pin { row, .. } => row,
+                PlacementLocation::Virtual => -100,
+            })
+            .collect();
+        assert_eq!(rows, vec![2, 8]);
+    }
+
+    #[test]
+    fn graphics_scroll_partial_region_from_top_uses_scrollback() {
+        let size = TermSize::new(10, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        // Region starts at the screen top but ends mid-screen: Line(0)..Line(6).
+        term.set_scrolling_region(1, Some(6));
+        let pin = |row| Placement {
+            image_id: 1,
+            location: PlacementLocation::Pin { row, col: 0 },
+            ..Default::default()
+        };
+        term.graphics_state.placements.push(pin(0)); // scrolls into scrollback
+        term.graphics_state.placements.push(pin(8)); // below the region, untouched
+
+        term.scroll_up(1);
+
+        let rows: Vec<i32> = term
+            .graphics_state
+            .placements
+            .iter()
+            .map(|p| match p.location {
+                PlacementLocation::Pin { row, .. } => row,
+                PlacementLocation::Virtual => -100,
+            })
+            .collect();
+        assert_eq!(rows, vec![-1, 8]);
+    }
+
+    #[test]
+    fn graphics_full_screen_scroll_shifts_scrollback_placements() {
+        let size = TermSize::new(10, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let pin = |row| Placement {
+            image_id: 1,
+            location: PlacementLocation::Pin { row, col: 0 },
+            ..Default::default()
+        };
+        // Place two images in the active area.
+        term.graphics_state.placements.push(pin(0));
+        term.graphics_state.placements.push(pin(5));
+
+        // After 3 full-screen scrolls:
+        //   pin(0) → -1 → -2 → -3  (enters scrollback, keeps shifting)
+        //   pin(5) → 4 → 3 → 2     (still in active area)
+        term.scroll_up(1);
+        term.scroll_up(1);
+        term.scroll_up(1);
+
+        let rows: Vec<i32> = term
+            .graphics_state
+            .placements
+            .iter()
+            .map(|p| match p.location {
+                PlacementLocation::Pin { row, .. } => row,
+                PlacementLocation::Virtual => -100,
+            })
+            .collect();
+        assert_eq!(rows, vec![-3, 2]);
+    }
+
+    #[test]
+    fn graphics_scrollback_placement_shifts_on_full_screen_scroll() {
+        let size = TermSize::new(10, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let pin = |row| Placement {
+            image_id: 1,
+            location: PlacementLocation::Pin { row, col: 0 },
+            ..Default::default()
+        };
+        // Seed a placement already in scrollback (simulated by first
+        // scrolling it there), then verify a further scroll still shifts it.
+        term.graphics_state.placements.push(pin(0));
+        term.scroll_up(1); // row: 0 → -1
+
+        // One more scroll: the scrollback placement must also shift.
+        term.scroll_up(1); // row: -1 → -2
+
+        let rows: Vec<i32> = term
+            .graphics_state
+            .placements
+            .iter()
+            .map(|p| match p.location {
+                PlacementLocation::Pin { row, .. } => row,
+                PlacementLocation::Virtual => -100,
+            })
+            .collect();
+        assert_eq!(rows, vec![-2]);
+    }
+
+    #[test]
+    fn graphics_repeated_full_screen_scroll_keeps_shifting_scrollback() {
+        let size = TermSize::new(10, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let pin = |row| Placement {
+            image_id: 1,
+            location: PlacementLocation::Pin { row, col: 0 },
+            ..Default::default()
+        };
+        // Place image at the top of screen.
+        term.graphics_state.placements.push(pin(0));
+
+        // Scroll 3 times: row should go 0 → -1 → -2 → -3.
+        term.scroll_up(1);
+        term.scroll_up(1);
+        term.scroll_up(1);
+
+        let rows: Vec<i32> = term
+            .graphics_state
+            .placements
+            .iter()
+            .map(|p| match p.location {
+                PlacementLocation::Pin { row, .. } => row,
+                PlacementLocation::Virtual => -100,
+            })
+            .collect();
+        assert_eq!(rows, vec![-3]);
+    }
+
+    #[test]
+    fn graphics_cursor_advance_is_bounded() {
+        use base64::Engine;
+        let size = TermSize::new(10, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        let payload = base64::engine::general_purpose::STANDARD.encode([0u8, 0, 0, 255]);
+        let apc = format!("Ga=T,f=32,s=1,v=1,i=8,r=4294967295,c=1;{payload}");
+        term.apc_start();
+        for byte in apc.bytes() {
+            term.apc_put(byte);
+        }
+        term.apc_end();
+
+        // Cursor stops at the bottom instead of spinning through 4G linefeeds.
+        assert_eq!(term.renderable_content().cursor.point.line.0, 9);
     }
 
     #[test]
