@@ -282,7 +282,7 @@ fn load_and_store(
 
     if t.image_id > 0 {
         remove_placements_for_image(placements, storage, t.image_id);
-        storage.delete(&DeleteAction::ById { image_id: t.image_id, delete_data: true });
+        storage.delete(&DeleteAction::ById { image_id: t.image_id, placement_id: 0, delete_data: true });
     }
 
     let current = start_loading(cmd, storage)?;
@@ -401,12 +401,16 @@ fn delete_placements(
                 storage.remove_reference(placement.image_id);
             }
         },
-        DeleteAction::ById { image_id, .. } => {
-            remove_placements_for_image(placements, storage, *image_id);
+        DeleteAction::ById { image_id, placement_id, .. } => {
+            remove_placements_matching(placements, storage, |p| {
+                p.image_id == *image_id && (*placement_id == 0 || p.placement_id == *placement_id)
+            });
         },
-        DeleteAction::ByNumber { image_number, .. } => {
+        DeleteAction::ByNumber { image_number, placement_id, .. } => {
             if let Some(id) = storage.get_image_by_number(*image_number).map(|img| img.id) {
-                remove_placements_for_image(placements, storage, id);
+                remove_placements_matching(placements, storage, |p| {
+                    p.image_id == id && (*placement_id == 0 || p.placement_id == *placement_id)
+                });
             }
         },
         DeleteAction::AtCursor { .. } => {
@@ -512,13 +516,13 @@ fn delete_data_for_images(storage: &mut ImageStorage, removed_image_ids: &[u32],
         seen.push(image_id);
         storage.delete(&match action {
             DeleteAction::ByRange { delete_data, .. } => {
-                DeleteAction::ById { image_id, delete_data: *delete_data }
+                DeleteAction::ById { image_id, placement_id: 0, delete_data: *delete_data }
             },
             DeleteAction::AtPosition { delete_data, .. }
             | DeleteAction::ByZIndex { delete_data, .. }
             | DeleteAction::InColumn { delete_data, .. }
-            | DeleteAction::InRow { delete_data, .. } => DeleteAction::ById { image_id, delete_data: *delete_data },
-            _ => DeleteAction::ById { image_id, delete_data: true },
+            | DeleteAction::InRow { delete_data, .. } => DeleteAction::ById { image_id, placement_id: 0, delete_data: *delete_data },
+            _ => DeleteAction::ById { image_id, placement_id: 0, delete_data: true },
         });
     }
 }
@@ -776,7 +780,7 @@ mod tests {
 
         let delete = Command {
             action: Action::Delete,
-            delete: DeleteAction::ById { image_id: 40, delete_data: true },
+            delete: DeleteAction::ById { image_id: 40, placement_id: 0, delete_data: true },
             ..Default::default()
         };
         execute(&delete, &mut storage, &mut placements, &mut loading, 0, 0);
@@ -1206,6 +1210,35 @@ mod tests {
         assert_eq!(placements.len(), 1);
     }
 
+    /// d=i with p= deletes only the named placement of the image.
+    #[test]
+    fn test_delete_by_id_with_placement_selector() {
+        let mut storage = ImageStorage::new();
+        let mut placements = Vec::new();
+        let mut loading = None;
+        execute(&transmit_cmd(95, &rgba_1x1(), false), &mut storage, &mut placements, &mut loading, 0, 0);
+
+        let display = |placement_id, _row| Command {
+            action: Action::Display,
+            transmission: Transmission { image_id: 95, placement_id, ..Default::default() },
+            ..Default::default()
+        };
+        execute(&display(1, 0), &mut storage, &mut placements, &mut loading, 0, 0);
+        execute(&display(2, 0), &mut storage, &mut placements, &mut loading, 1, 0);
+        assert_eq!(placements.len(), 2);
+
+        let delete = Command {
+            action: Action::Delete,
+            transmission: Transmission { image_id: 95, placement_id: 1, ..Default::default() },
+            delete: DeleteAction::ById { image_id: 95, placement_id: 1, delete_data: false },
+            ..Default::default()
+        };
+        execute(&delete, &mut storage, &mut placements, &mut loading, 0, 0);
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].placement_id, 2);
+        assert!(storage.get_image(95).is_some(), "image data must survive");
+    }
+
     /// Deletes answer only when the client supplied an id/number to match.
     #[test]
     fn test_delete_response() {
@@ -1218,7 +1251,7 @@ mod tests {
             action: Action::Delete,
             quiet,
             transmission: Transmission { image_id: 94, ..Default::default() },
-            delete: DeleteAction::ById { image_id: 94, delete_data: false },
+            delete: DeleteAction::ById { image_id: 94, placement_id: 0, delete_data: false },
             ..Default::default()
         };
         let result = execute(&delete(Quiet::No), &mut storage, &mut placements, &mut loading, 0, 0);

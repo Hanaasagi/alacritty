@@ -132,10 +132,10 @@ pub struct DisplayCmd {
 pub enum DeleteAction {
     /// Delete all images (d=a or d=A).
     All { delete_data: bool },
-    /// Delete by image id (d=i or d=I).
-    ById { image_id: u32, delete_data: bool },
-    /// Delete by image number (d=n or d=N).
-    ByNumber { image_number: u32, delete_data: bool },
+    /// Delete by image id (d=i or d=I). `placement_id` 0 = all placements.
+    ById { image_id: u32, placement_id: u32, delete_data: bool },
+    /// Delete by image number (d=n or d=N). `placement_id` 0 = all placements.
+    ByNumber { image_number: u32, placement_id: u32, delete_data: bool },
     /// Delete at cursor position (d=c or d=C).
     AtCursor { delete_data: bool },
     /// Delete animation frames (d=f).
@@ -678,13 +678,25 @@ fn parse_delete(kv: &Kv) -> DeleteAction {
     match what {
         b'a' => DeleteAction::All { delete_data: false },
         b'A' => DeleteAction::All { delete_data: true },
-        b'i' => DeleteAction::ById { image_id: kv.get(b'i').unwrap_or(0), delete_data: false },
-        b'I' => DeleteAction::ById { image_id: kv.get(b'i').unwrap_or(0), delete_data: true },
-        b'n' => {
-            DeleteAction::ByNumber { image_number: kv.get(b'I').unwrap_or(0), delete_data: false }
+        b'i' => DeleteAction::ById {
+            image_id: kv.get(b'i').unwrap_or(0),
+            placement_id: kv.get(b'p').unwrap_or(0),
+            delete_data: false,
         },
-        b'N' => {
-            DeleteAction::ByNumber { image_number: kv.get(b'I').unwrap_or(0), delete_data: true }
+        b'I' => DeleteAction::ById {
+            image_id: kv.get(b'i').unwrap_or(0),
+            placement_id: kv.get(b'p').unwrap_or(0),
+            delete_data: true,
+        },
+        b'n' => DeleteAction::ByNumber {
+            image_number: kv.get(b'I').unwrap_or(0),
+            placement_id: kv.get(b'p').unwrap_or(0),
+            delete_data: false,
+        },
+        b'N' => DeleteAction::ByNumber {
+            image_number: kv.get(b'I').unwrap_or(0),
+            placement_id: kv.get(b'p').unwrap_or(0),
+            delete_data: true,
         },
         b'c' => DeleteAction::AtCursor { delete_data: false },
         b'C' => DeleteAction::AtCursor { delete_data: true },
@@ -811,13 +823,13 @@ mod tests {
     #[test]
     fn test_parse_delete_by_id() {
         let cmd = parse_after_g("a=d,d=i,i=42");
-        assert_eq!(cmd.delete, DeleteAction::ById { image_id: 42, delete_data: false });
+        assert_eq!(cmd.delete, DeleteAction::ById { image_id: 42, placement_id: 0, delete_data: false });
     }
 
     #[test]
     fn test_parse_delete_by_id_data_only() {
         let cmd = parse_after_g("a=d,d=I,i=42");
-        assert_eq!(cmd.delete, DeleteAction::ById { image_id: 42, delete_data: true });
+        assert_eq!(cmd.delete, DeleteAction::ById { image_id: 42, placement_id: 0, delete_data: true });
     }
 
     #[test]
@@ -986,11 +998,11 @@ mod tests {
         );
         assert_eq!(
             parse_after_g("a=d,d=n,I=3").delete,
-            DeleteAction::ByNumber { image_number: 3, delete_data: false }
+            DeleteAction::ByNumber { image_number: 3, placement_id: 0, delete_data: false }
         );
         assert_eq!(
             parse_after_g("a=d,d=N,I=3").delete,
-            DeleteAction::ByNumber { image_number: 3, delete_data: true }
+            DeleteAction::ByNumber { image_number: 3, placement_id: 0, delete_data: true }
         );
         assert_eq!(
             parse_after_g("a=d,d=c").delete,

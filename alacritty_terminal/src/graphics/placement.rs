@@ -75,7 +75,15 @@ impl Placement {
             PlacementLocation::Pin { row: cursor_row, col: cursor_col }
         };
 
-        let placement_id = resolve_placement_id(display.placement_id, transmission_placement_id, placements);
+        let placement_id =
+            if virtual_placement && display.placement_id == 0 && transmission_placement_id == 0 {
+                // Placeholders without an underline color carry placement id 0;
+                // keep the placement findable under it instead of auto-assigning
+                // an id that no placeholder can ever reference.
+                0
+            } else {
+                resolve_placement_id(display.placement_id, transmission_placement_id, placements)
+            };
 
         Self {
             image_id,
@@ -136,6 +144,28 @@ mod tests {
         assert_eq!(placement.z_index, -1);
         assert_eq!(placement.location, PlacementLocation::Pin { row: 3, col: 4 });
         assert!(!placement.virtual_placement);
+    }
+
+    /// U=1 without p= keeps placement id 0 so bare placeholders (no
+    /// underline color) can reference it.
+    #[test]
+    fn test_virtual_placement_defaults_to_zero_id() {
+        let display = DisplayCmd {
+            virtual_placement: crate::graphics::command::VirtualPlacement::Yes,
+            ..Default::default()
+        };
+        let placement = Placement::from_display(1, &display, 0, 0, 0, &[]);
+        assert_eq!(placement.placement_id, 0);
+        assert!(placement.virtual_placement);
+
+        // Explicit p= still wins.
+        let display = DisplayCmd {
+            virtual_placement: crate::graphics::command::VirtualPlacement::Yes,
+            placement_id: 5,
+            ..Default::default()
+        };
+        let placement = Placement::from_display(1, &display, 0, 0, 0, &[]);
+        assert_eq!(placement.placement_id, 5);
     }
 
     #[test]

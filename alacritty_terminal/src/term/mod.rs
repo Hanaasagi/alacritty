@@ -3543,7 +3543,7 @@ mod tests {
         term.clear_screen(ansi::ClearMode::All);
         term.graphics_state
             .storage
-            .delete(&crate::graphics::DeleteAction::ById { image_id: 1, delete_data: true });
+            .delete(&crate::graphics::DeleteAction::ById { image_id: 1, placement_id: 0, delete_data: true });
         assert!(term.graphics_state.storage.get_image(1).is_none());
     }
 

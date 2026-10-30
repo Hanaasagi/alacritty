@@ -247,15 +247,6 @@ impl Renderer {
         }
 
         for placement in placements {
-            let x = size_info.padding_x()
-                + placement.viewport_col as f32 * size_info.cell_width()
-                + placement.x_offset as f32;
-            let y = size_info.padding_y()
-                + placement.viewport_row as f32 * size_info.cell_height()
-                + placement.y_offset as f32;
-            let width = placement.display_cols as f32 * size_info.cell_width();
-            let height = placement.display_rows as f32 * size_info.cell_height();
-
             let source_rect = Some([
                 placement.source_x as f32,
                 placement.source_y as f32,
@@ -265,10 +256,10 @@ impl Renderer {
 
             self.image_renderer.draw_image(
                 placement.image_id,
-                x,
-                y,
-                width,
-                height,
+                placement.x,
+                placement.y,
+                placement.width,
+                placement.height,
                 source_rect,
                 size_info,
             );

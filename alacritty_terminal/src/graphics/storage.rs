@@ -113,10 +113,10 @@ impl ImageStorage {
                     self.clear_all_images();
                 }
             },
-            DeleteAction::ById { image_id, delete_data } => {
+            DeleteAction::ById { image_id, delete_data, .. } => {
                 self.delete_by_id(*image_id, *delete_data);
             },
-            DeleteAction::ByNumber { image_number, delete_data } => {
+            DeleteAction::ByNumber { image_number, delete_data, .. } => {
                 let id = self
                     .images
                     .values()
@@ -297,7 +297,7 @@ mod tests {
     fn test_delete_by_id() {
         let mut storage = ImageStorage::new();
         storage.add_image(sample_image(1, 16)).unwrap();
-        storage.delete(&DeleteAction::ById { image_id: 1, delete_data: true });
+        storage.delete(&DeleteAction::ById { image_id: 1, placement_id: 0, delete_data: true });
         assert!(storage.get_image(1).is_none());
     }
 
@@ -344,7 +344,7 @@ mod tests {
         let mut storage = ImageStorage::new();
         storage.add_image(sample_image(1, 16)).unwrap();
         storage.set_references(1, 1);
-        storage.delete(&DeleteAction::ById { image_id: 1, delete_data: true });
+        storage.delete(&DeleteAction::ById { image_id: 1, placement_id: 0, delete_data: true });
         let image = storage.get_image(1).unwrap();
         assert!(image.data.is_empty());
         assert_eq!(storage.total_bytes(), 0);
@@ -355,7 +355,7 @@ mod tests {
         let mut storage = ImageStorage::new();
         storage.add_image(sample_image(1, 16)).unwrap();
         storage.add_image(sample_image(2, 16)).unwrap();
-        storage.delete(&DeleteAction::ById { image_id: 1, delete_data: true });
+        storage.delete(&DeleteAction::ById { image_id: 1, placement_id: 0, delete_data: true });
         assert!(storage.get_image(1).is_none());
         assert!(storage.get_image(2).is_some());
     }
@@ -372,7 +372,7 @@ mod tests {
     fn test_delete_by_number() {
         let mut storage = ImageStorage::new();
         storage.add_image(sample_image(5, 16)).unwrap();
-        storage.delete(&DeleteAction::ByNumber { image_number: 50, delete_data: true });
+        storage.delete(&DeleteAction::ByNumber { image_number: 50, placement_id: 0, delete_data: true });
         assert!(storage.get_image(5).is_none());
         assert!(storage.get_image_by_number(50).is_none());
     }
