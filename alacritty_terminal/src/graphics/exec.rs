@@ -87,7 +87,16 @@ fn execute_transmit(
 
     // Grab the saved display intent before load_and_store consumes the
     // LoadingImage (on the final chunk, take() moves it out).
-    let saved_display = loading.as_ref().and_then(|li| li.pending_display.clone());
+    //
+    // Discard it when the incoming command uses a non-direct medium:
+    // non-direct transmissions unconditionally abandon any in-progress
+    // chunked load, so the saved display belongs to a different (now
+    // discarded) transmission and must not bleed into the new image.
+    let saved_display = if cmd.transmission.medium == Medium::Direct {
+        loading.as_ref().and_then(|li| li.pending_display.clone())
+    } else {
+        None
+    };
 
     match load_and_store(cmd, storage, placements, loading) {
         Ok(LoadOutcome { image, more, implicit_id }) => {
@@ -250,13 +259,24 @@ fn load_and_store(
 ) -> Result<LoadOutcome, ExecError> {
     let t = &cmd.transmission;
 
+    // Non-direct mediums (file, temp-file, shared-memory) are always
+    // single-shot — they never participate in chunked loading. If one
+    // arrives while a chunked direct transmission is in progress, abandon
+    // the incomplete load (following Ghostty's 3079a4396 fix).
+    if t.medium != Medium::Direct {
+        *loading = None;
+    }
+
     if let Some(ref current) = *loading {
         if t.image_id != 0 && current.id != t.image_id {
             *loading = None;
         }
     }
 
+    // Invariant: if we reach here with `loading.is_some()`, the medium is
+    // Direct (non-Direct was cleared above).
     if let Some(existing) = loading.take() {
+        debug_assert_eq!(t.medium, Medium::Direct);
         let mut current = existing;
         current.add_data(&cmd.data).map_err(ExecError::Image)?;
         if t.more_chunks {
@@ -289,7 +309,7 @@ fn load_and_store(
     }
 
     let current = start_loading(cmd, storage)?;
-    if t.more_chunks {
+    if t.more_chunks && t.medium == Medium::Direct {
         let implicit_id = current.implicit_id;
         let id = current.id;
         *loading = Some(current);
@@ -417,7 +437,20 @@ fn read_file_payload(
 
     let path = Path::new(path_str);
 
-    // Open first, then validate — the fd is pinned to the actual inode.
+    // Open with O_NONBLOCK on Unix to prevent blocking on FIFOs/named
+    // pipes that have no writer. Graphics commands run synchronously under
+    // the terminal lock, so a blocking open would freeze the entire
+    // terminal. The flag is harmless for regular files.
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|_| ExecError::Message("ENOENT: cannot open file"))?
+    };
+    #[cfg(not(unix))]
     let mut file = fs::File::open(path)
         .map_err(|_| ExecError::Message("ENOENT: cannot open file"))?;
 
@@ -1627,6 +1660,155 @@ mod tests {
             0,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_file_medium_abandons_chunked_load() {
+        use std::io::Write;
+
+        let mut storage = ImageStorage::new();
+        let mut placements = Vec::new();
+        let mut loading = None;
+
+        // Start a chunked direct transmission (more_chunks=true).
+        let chunk1 = Command {
+            action: Action::Transmit,
+            transmission: Transmission {
+                format: Format::Rgba,
+                medium: Medium::Direct,
+                width: 1,
+                height: 1,
+                image_id: 200,
+                more_chunks: true,
+                ..Default::default()
+            },
+            data: vec![255, 0, 0, 255],
+            ..Default::default()
+        };
+        execute(&chunk1, &mut storage, &mut placements, &mut loading, 0, 0);
+        assert!(loading.is_some(), "chunked load should be in progress");
+
+        // A file medium command arrives — should abandon the chunked load.
+        let rgba = rgba_1x1();
+        let dir = std::env::temp_dir();
+        let path = dir.join("alacritty_test_abandon_chunk.rgba");
+        std::fs::File::create(&path).unwrap().write_all(&rgba).unwrap();
+
+        let file_cmd = Command {
+            action: Action::Transmit,
+            transmission: Transmission {
+                format: Format::Rgba,
+                medium: Medium::File,
+                width: 1,
+                height: 1,
+                image_id: 201,
+                ..Default::default()
+            },
+            data: path.to_string_lossy().into_owned().into_bytes(),
+            ..Default::default()
+        };
+        let result = execute(&file_cmd, &mut storage, &mut placements, &mut loading, 0, 0);
+        assert!(result.response.is_some());
+        // The file image should be stored; the chunked load abandoned.
+        assert!(storage.get_image(201).is_some());
+        assert!(loading.is_none(), "loading should be cleared after file medium");
+        // The partial chunked image (200) should NOT be stored.
+        assert!(storage.get_image(200).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_file_medium_ignores_more_chunks() {
+        use std::io::Write;
+
+        let rgba = rgba_1x1();
+        let dir = std::env::temp_dir();
+        let path = dir.join("alacritty_test_no_chunk.rgba");
+        std::fs::File::create(&path).unwrap().write_all(&rgba).unwrap();
+
+        let mut storage = ImageStorage::new();
+        let mut placements = Vec::new();
+        let mut loading = None;
+
+        // File medium with more_chunks=true should NOT enter chunked mode.
+        let cmd = Command {
+            action: Action::Transmit,
+            transmission: Transmission {
+                format: Format::Rgba,
+                medium: Medium::File,
+                width: 1,
+                height: 1,
+                image_id: 202,
+                more_chunks: true,
+                ..Default::default()
+            },
+            data: path.to_string_lossy().into_owned().into_bytes(),
+            ..Default::default()
+        };
+        let result = execute(&cmd, &mut storage, &mut placements, &mut loading, 0, 0);
+        assert!(result.response.is_some());
+        // Image should be fully loaded (not chunked).
+        assert!(storage.get_image(202).is_some());
+        assert!(loading.is_none(), "file medium should not enter chunked loading");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P2 fix: a chunked `a=T,m=1` followed by a file `a=t` must NOT
+    /// inherit the abandoned T&D's display intent (saved_display).
+    #[test]
+    fn test_file_medium_does_not_inherit_saved_display() {
+        use std::io::Write;
+
+        let mut storage = ImageStorage::new();
+        let mut placements = Vec::new();
+        let mut loading = None;
+
+        // Start a chunked TransmitAndDisplay (a=T, m=1).
+        let first = Command {
+            action: Action::TransmitAndDisplay,
+            transmission: Transmission {
+                format: Format::Rgba,
+                medium: Medium::Direct,
+                width: 1,
+                height: 1,
+                image_id: 300,
+                more_chunks: true,
+                ..Default::default()
+            },
+            data: vec![255, 0, 0, 255],
+            ..Default::default()
+        };
+        execute_transmit(&first, &mut storage, &mut placements, &mut loading, Some((2, 4)));
+        assert!(loading.is_some());
+        assert!(loading.as_ref().unwrap().pending_display.is_some());
+
+        // Now a file-medium Transmit (NOT TransmitAndDisplay) arrives.
+        let rgba = rgba_1x1();
+        let dir = std::env::temp_dir();
+        let path = dir.join("alacritty_test_no_inherit_display.rgba");
+        std::fs::File::create(&path).unwrap().write_all(&rgba).unwrap();
+
+        let file_cmd = Command {
+            action: Action::Transmit,
+            transmission: Transmission {
+                format: Format::Rgba,
+                medium: Medium::File,
+                width: 1,
+                height: 1,
+                image_id: 301,
+                ..Default::default()
+            },
+            data: path.to_string_lossy().into_owned().into_bytes(),
+            ..Default::default()
+        };
+        execute_transmit(&file_cmd, &mut storage, &mut placements, &mut loading, None);
+
+        // The file image (301) should be stored but NOT have a placement
+        // (it was action=Transmit, not TransmitAndDisplay).
+        assert!(storage.get_image(301).is_some());
+        let has_placement_301 = placements.iter().any(|p| p.image_id == 301);
+        assert!(!has_placement_301, "file image should not inherit abandoned T&D placement");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
