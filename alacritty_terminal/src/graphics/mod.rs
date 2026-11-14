@@ -22,8 +22,10 @@ pub struct GraphicsState {
     pub placements: Vec<Placement>,
     pub loading: Option<LoadingImage>,
     pub parser: command::Parser,
-    /// Whether graphics state needs to be synced to the renderer.
-    pub dirty: bool,
+    /// Monotonic change counter. Bumped on every structural or content
+    /// mutation so consumers can detect changes by comparing their cached
+    /// snapshot against the current value. Never reset to zero.
+    dirty: u64,
 }
 
 impl GraphicsState {
@@ -37,8 +39,32 @@ impl GraphicsState {
             placements: Vec::new(),
             loading: None,
             parser: command::Parser::new(),
-            dirty: false,
+            dirty: 0,
         }
+    }
+
+    /// Bump the dirty counter for geometry-only changes (scroll, resize,
+    /// history erasure) that move or remove placements without changing
+    /// image content.
+    #[inline]
+    pub fn mark_dirty(&mut self) {
+        self.dirty = self.dirty.wrapping_add(1);
+    }
+
+    /// Bump the dirty counter for content mutations (image add/remove,
+    /// placement add/remove, pixel data change). Currently equivalent to
+    /// `mark_dirty`; a separate `generation` counter for texture cache
+    /// invalidation can be added later when animation support lands.
+    #[inline]
+    pub fn mark_mutated(&mut self) {
+        self.mark_dirty();
+    }
+
+    /// Current dirty counter value. Consumers store this and compare with
+    /// future values to detect changes — **never** reset it.
+    #[inline]
+    pub fn dirty(&self) -> u64 {
+        self.dirty
     }
 }
 

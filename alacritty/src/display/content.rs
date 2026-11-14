@@ -47,7 +47,10 @@ pub struct RenderableImagePlacement {
 pub struct RenderableGraphics {
     pub placements: Vec<RenderableImagePlacement>,
     pub images: HashMap<u32, RenderableImage>,
-    pub sync_to_gpu: bool,
+    /// Dirty counter snapshot taken from `GraphicsState` at collect time.
+    /// The caller compares this against its cached value to decide whether
+    /// GPU textures need re-uploading.
+    pub dirty_snapshot: u64,
     /// All image IDs referenced by any placement (including off-viewport).
     pub all_image_ids: Vec<u32>,
 }
@@ -64,8 +67,9 @@ impl RenderableGraphics {
         term: &Term<T>,
         display_offset: usize,
         size_info: &SizeInfo,
+        needs_sync: bool,
     ) -> Self {
-        let sync_to_gpu = term.graphics_state.dirty;
+        let dirty_snapshot = term.graphics_state.dirty();
         let virtual_infos = collect_virtual_placement_infos(term);
 
         let mut all_image_ids = Vec::with_capacity(term.graphics_state.placements.len());
@@ -87,7 +91,7 @@ impl RenderableGraphics {
         // replaced while off-screen (e.g. in scrollback) must not keep its
         // stale GPU texture when it scrolls back into view.
         let mut images = HashMap::new();
-        if sync_to_gpu {
+        if needs_sync {
             for &image_id in &all_image_ids {
                 if let Some(image) = term.graphics_state.storage.get_image(image_id) {
                     images.insert(
@@ -102,7 +106,7 @@ impl RenderableGraphics {
             }
         }
 
-        Self { placements, images, sync_to_gpu, all_image_ids }
+        Self { placements, images, dirty_snapshot, all_image_ids }
     }
 }
 

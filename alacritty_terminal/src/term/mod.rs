@@ -527,7 +527,7 @@ impl<T> Term<T> {
         for placement in removed {
             self.graphics_state.storage.remove_reference(placement.image_id);
         }
-        self.graphics_state.dirty = true;
+        self.graphics_state.mark_mutated();
     }
 
     /// Drop placements pinned in scrollback (negative rows), used by ED 3.
@@ -544,7 +544,7 @@ impl<T> Term<T> {
         for id in removed_ids {
             self.graphics_state.storage.remove_reference(id);
         }
-        self.graphics_state.dirty = true;
+        self.graphics_state.mark_mutated();
     }
 
     fn adjust_graphics_placements_on_scroll(
@@ -614,7 +614,7 @@ impl<T> Term<T> {
         for id in removed_ids {
             self.graphics_state.storage.remove_reference(id);
         }
-        self.graphics_state.dirty = true;
+        self.graphics_state.mark_dirty();
     }
 
     /// Set new options for the [`Term`].
@@ -647,7 +647,7 @@ impl<T> Term<T> {
             self.graphics_state
                 .storage
                 .set_max_limit(self.config.graphics_max_memory_bytes());
-            self.graphics_state.dirty = true;
+            self.graphics_state.mark_mutated();
         }
 
         if !self.config.kitty_graphics && old_config.kitty_graphics {
@@ -866,7 +866,7 @@ impl<T> Term<T> {
 
         mem::swap(&mut self.grid, &mut self.inactive_grid);
         mem::swap(&mut self.graphics_state.placements, &mut self.inactive_graphics_placements);
-        self.graphics_state.dirty = true;
+        self.graphics_state.mark_mutated();
         self.mode ^= TermMode::ALT_SCREEN;
         self.selection = None;
         self.mark_fully_damaged();
@@ -1661,7 +1661,7 @@ impl<T: EventListener> Handler for Term<T> {
             self.graphics_state.placements.len(),
             self.graphics_state.storage.total_bytes(),
         );
-        self.graphics_state.dirty = true;
+        self.graphics_state.mark_mutated();
     }
 
     #[inline]

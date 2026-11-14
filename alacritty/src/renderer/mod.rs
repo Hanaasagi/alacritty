@@ -192,7 +192,7 @@ impl Renderer {
 
     /// Upload textures and clean up stale ones. Call once per frame.
     pub fn sync_image_textures(&mut self, graphics: &RenderableGraphics) {
-        if graphics.sync_to_gpu {
+        if !graphics.images.is_empty() {
             for (&image_id, image) in &graphics.images {
                 self.image_renderer.upload_image(image_id, image.width, image.height, &image.data);
             }
