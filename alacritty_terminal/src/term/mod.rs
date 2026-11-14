@@ -3534,6 +3534,7 @@ mod tests {
             data: vec![0; 4],
             image_number: 0,
             implicit_id: false,
+            transmission_order: 0,
         }).unwrap();
         term.graphics_state.placements.push(Placement { image_id: 1, ..Default::default() });
         term.graphics_state.storage.add_reference(1);

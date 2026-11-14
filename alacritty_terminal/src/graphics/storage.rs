@@ -17,6 +17,8 @@ pub struct ImageStorage {
     total_bytes: usize,
     total_limit: usize,
     next_image_id: u32,
+    /// Monotonic counter stamped onto every image at insertion time.
+    next_transmission: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +45,7 @@ impl ImageStorage {
             total_bytes: 0,
             total_limit: limit,
             next_image_id: 2_147_483_647,
+            next_transmission: 1,
         }
     }
 
@@ -60,7 +63,11 @@ impl ImageStorage {
 
     /// Add an image. If an image with the same ID exists, replace it.
     /// If storage is full, evict oldest images to make room.
-    pub fn add_image(&mut self, image: Image) -> Result<(), StorageError> {
+    ///
+    /// Stamps the image with a monotonically increasing `transmission_order`
+    /// so that `get_image_by_number` can always return the most recently
+    /// transmitted image when multiple share the same number.
+    pub fn add_image(&mut self, mut image: Image) -> Result<(), StorageError> {
         let new_len = image.data.len();
         if new_len > self.total_limit {
             return Err(StorageError::ImageTooLarge);
@@ -76,6 +83,10 @@ impl ImageStorage {
         if self.total_bytes - old_len + new_len > self.total_limit {
             return Err(StorageError::ImageTooLarge);
         }
+
+        let order = self.next_transmission;
+        self.next_transmission = self.next_transmission.wrapping_add(1);
+        image.transmission_order = order;
 
         if let Some(record) = self.images.get_mut(&id) {
             self.total_bytes -= record.image.data.len();
@@ -94,14 +105,20 @@ impl ImageStorage {
         self.images.get(&id).map(|record| &record.image)
     }
 
-    /// Get an image by image_number (`I=` parameter).
+    /// Get the most recently transmitted image with the given image number.
+    ///
+    /// When multiple images share the same `image_number`, the one with the
+    /// highest `transmission_order` wins. This matches Kitty semantics and
+    /// avoids animation frame updates (which only change a future generation
+    /// counter) from stealing the "newest" slot.
     pub fn get_image_by_number(&self, number: u32) -> Option<&Image> {
         if number == 0 {
             return None;
         }
         self.images
             .values()
-            .find(|record| record.image.image_number == number)
+            .filter(|record| record.image.image_number == number)
+            .max_by_key(|record| record.image.transmission_order)
             .map(|record| &record.image)
     }
 
@@ -117,12 +134,7 @@ impl ImageStorage {
                 self.delete_by_id(*image_id, *delete_data);
             },
             DeleteAction::ByNumber { image_number, delete_data, .. } => {
-                let id = self
-                    .images
-                    .values()
-                    .find(|record| record.image.image_number == *image_number)
-                    .map(|record| record.image.id);
-                if let Some(id) = id {
+                if let Some(id) = self.get_image_by_number(*image_number).map(|img| img.id) {
                     self.delete_by_id(id, *delete_data);
                 }
             },
@@ -260,6 +272,7 @@ mod tests {
             data: vec![0xAB; size],
             image_number: id.saturating_mul(10),
             implicit_id: false,
+            transmission_order: 0,
         }
     }
 
@@ -366,6 +379,22 @@ mod tests {
         storage.add_image(sample_image(5, 16)).unwrap();
         assert!(storage.get_image_by_number(50).is_some());
         assert!(storage.get_image_by_number(99).is_none());
+    }
+
+    #[test]
+    fn test_get_image_by_number_returns_newest() {
+        let mut storage = ImageStorage::new();
+        let mut img_a = sample_image(1, 16);
+        img_a.image_number = 42;
+        storage.add_image(img_a).unwrap();
+
+        let mut img_b = sample_image(2, 16);
+        img_b.image_number = 42;
+        storage.add_image(img_b).unwrap();
+
+        let found = storage.get_image_by_number(42).unwrap();
+        assert_eq!(found.id, 2, "must return the most recently transmitted image");
+        assert!(found.transmission_order > storage.get_image(1).unwrap().transmission_order);
     }
 
     #[test]
