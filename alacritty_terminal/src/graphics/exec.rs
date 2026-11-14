@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use crate::graphics::command::{
     Action, Command, CursorMovement, DeleteAction, DisplayCmd, Medium, Quiet, Response,
     Transmission,
@@ -85,7 +87,16 @@ fn execute_transmit(
 
     // Grab the saved display intent before load_and_store consumes the
     // LoadingImage (on the final chunk, take() moves it out).
-    let saved_display = loading.as_ref().and_then(|li| li.pending_display.clone());
+    //
+    // Discard it when the incoming command uses a non-direct medium:
+    // non-direct transmissions unconditionally abandon any in-progress
+    // chunked load, so the saved display belongs to a different (now
+    // discarded) transmission and must not bleed into the new image.
+    let saved_display = if cmd.transmission.medium == Medium::Direct {
+        loading.as_ref().and_then(|li| li.pending_display.clone())
+    } else {
+        None
+    };
 
     match load_and_store(cmd, storage, placements, loading) {
         Ok(LoadOutcome { image, more, implicit_id }) => {
@@ -248,13 +259,24 @@ fn load_and_store(
 ) -> Result<LoadOutcome, ExecError> {
     let t = &cmd.transmission;
 
+    // Non-direct mediums (file, temp-file, shared-memory) are always
+    // single-shot — they never participate in chunked loading. If one
+    // arrives while a chunked direct transmission is in progress, abandon
+    // the incomplete load (following Ghostty's 3079a4396 fix).
+    if t.medium != Medium::Direct {
+        *loading = None;
+    }
+
     if let Some(ref current) = *loading {
         if t.image_id != 0 && current.id != t.image_id {
             *loading = None;
         }
     }
 
+    // Invariant: if we reach here with `loading.is_some()`, the medium is
+    // Direct (non-Direct was cleared above).
     if let Some(existing) = loading.take() {
+        debug_assert_eq!(t.medium, Medium::Direct);
         let mut current = existing;
         current.add_data(&cmd.data).map_err(ExecError::Image)?;
         if t.more_chunks {
@@ -269,6 +291,7 @@ fn load_and_store(
                     data: Vec::new(),
                     image_number: t.image_number,
                     implicit_id,
+                    transmission_order: 0,
                 },
                 more: true,
                 implicit_id,
@@ -286,7 +309,7 @@ fn load_and_store(
     }
 
     let current = start_loading(cmd, storage)?;
-    if t.more_chunks {
+    if t.more_chunks && t.medium == Medium::Direct {
         let implicit_id = current.implicit_id;
         let id = current.id;
         *loading = Some(current);
@@ -298,6 +321,7 @@ fn load_and_store(
                 data: Vec::new(),
                 image_number: t.image_number,
                 implicit_id,
+                transmission_order: 0,
             },
             more: true,
             implicit_id,
@@ -312,10 +336,6 @@ fn load_and_store(
 
 fn start_loading(cmd: &Command, storage: &mut ImageStorage) -> Result<LoadingImage, ExecError> {
     let t = &cmd.transmission;
-    if t.medium != Medium::Direct {
-        return Err(ExecError::Message("EINVAL: unsupported transmission medium"));
-    }
-
     let (id, implicit_id) = resolve_image_id(t, storage);
     let mut loading = LoadingImage::with_number(
         id,
@@ -326,14 +346,24 @@ fn start_loading(cmd: &Command, storage: &mut ImageStorage) -> Result<LoadingIma
         implicit_id,
         t.image_number,
     );
-    loading.add_data(&cmd.data).map_err(ExecError::Image)?;
+
+    match t.medium {
+        Medium::Direct => {
+            loading.add_data(&cmd.data).map_err(ExecError::Image)?;
+        },
+        Medium::File | Medium::TempFile => {
+            let data = read_file_payload(&cmd.data, t.medium, t.offset, t.size)?;
+            loading.add_data(&data).map_err(ExecError::Image)?;
+        },
+        Medium::SharedMemory => {
+            return Err(ExecError::Message("EINVAL: shared memory transmission not yet supported"));
+        },
+    }
+
     Ok(loading)
 }
 
 fn try_complete_image(cmd: &Command) -> Result<(), ExecError> {
-    if cmd.transmission.medium != Medium::Direct {
-        return Err(ExecError::Message("EINVAL: unsupported transmission medium"));
-    }
     let t = &cmd.transmission;
     let mut loading = LoadingImage::with_number(
         t.image_id.max(1),
@@ -344,10 +374,214 @@ fn try_complete_image(cmd: &Command) -> Result<(), ExecError> {
         false,
         t.image_number,
     );
-    loading.add_data(&cmd.data).map_err(ExecError::Image)?;
+
+    match t.medium {
+        Medium::Direct => {
+            loading.add_data(&cmd.data).map_err(ExecError::Image)?;
+        },
+        Medium::File | Medium::TempFile => {
+            let data = read_file_payload(&cmd.data, t.medium, t.offset, t.size)?;
+            loading.add_data(&data).map_err(ExecError::Image)?;
+        },
+        Medium::SharedMemory => {
+            return Err(ExecError::Message("EINVAL: shared memory transmission not yet supported"));
+        },
+    }
+
     let image = loading.complete().map_err(ExecError::Image)?;
     drop(image);
     Ok(())
+}
+
+/// Maximum file size accepted via `t=f`/`t=t` (200 MiB).
+const MAX_FILE_READ: usize = 200 * 1024 * 1024;
+
+/// Marker substring required in `t=t` temp file paths (matching Kitty/Ghostty convention).
+const TEMP_FILE_MARKER: &str = "tty-graphics-protocol";
+
+/// Read image data from a file path in `cmd.data`.
+///
+/// `cmd.data` is already base64-decoded by the APC parser; it contains a
+/// UTF-8 file path. For `t=t` (temporary file), the file is deleted after
+/// reading.
+///
+/// Security model (follows Ghostty's approach):
+/// - Open the file **first**, then canonicalize the path and verify that
+///   the canonical path's inode matches the opened fd's inode — this
+///   closes the TOCTOU gap (a symlink swap between open and canonicalize
+///   is detected via inode mismatch).
+/// - Only regular files are accepted.
+/// - Sensitive pseudo-filesystem paths (`/proc`, `/sys`, `/dev` except
+///   `/dev/shm`) are blocked for both `t=f` and `t=t`.
+/// - For `t=t`, the resolved path must reside under a system temp directory
+///   and must contain the `tty-graphics-protocol` marker in its name.
+fn read_file_payload(
+    raw_payload: &[u8],
+    medium: Medium,
+    offset: u32,
+    size: u32,
+) -> Result<Vec<u8>, ExecError> {
+    use std::fs;
+    use std::io::{Read, Seek, SeekFrom};
+
+    if raw_payload.is_empty() {
+        return Err(ExecError::Message("EINVAL: empty file path"));
+    }
+
+    if size as usize > MAX_FILE_READ {
+        return Err(ExecError::Message("EINVAL: declared size exceeds maximum"));
+    }
+
+    let path_str = std::str::from_utf8(raw_payload)
+        .map_err(|_| ExecError::Message("EINVAL: file path is not valid UTF-8"))?;
+
+    let path = Path::new(path_str);
+
+    // Open with O_NONBLOCK on Unix to prevent blocking on FIFOs/named
+    // pipes that have no writer. Graphics commands run synchronously under
+    // the terminal lock, so a blocking open would freeze the entire
+    // terminal. The flag is harmless for regular files.
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|_| ExecError::Message("ENOENT: cannot open file"))?
+    };
+    #[cfg(not(unix))]
+    let mut file = fs::File::open(path)
+        .map_err(|_| ExecError::Message("ENOENT: cannot open file"))?;
+
+    // Verify the opened fd is a regular file.
+    let opened_meta = file.metadata()
+        .map_err(|_| ExecError::Message("EIO: cannot stat file"))?;
+    if !opened_meta.is_file() {
+        return Err(ExecError::Message("EINVAL: not a regular file"));
+    }
+
+    // Canonicalize for path-based validation.
+    let canonical = fs::canonicalize(path)
+        .map_err(|_| ExecError::Message("ENOENT: file not found"))?;
+
+    // TOCTOU guard: verify the canonical path still points to the same
+    // file we opened (same device + inode). If someone swapped the
+    // symlink between our open() and canonicalize(), the inodes diverge.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let canonical_meta = fs::metadata(&canonical)
+            .map_err(|_| ExecError::Message("ENOENT: canonical path disappeared"))?;
+        if opened_meta.dev() != canonical_meta.dev()
+            || opened_meta.ino() != canonical_meta.ino()
+        {
+            return Err(ExecError::Message("EINVAL: file path changed during validation"));
+        }
+    }
+
+    // Block sensitive pseudo-filesystem paths.
+    reject_sensitive_path(&canonical)?;
+
+    if medium == Medium::TempFile {
+        validate_temp_path(&canonical)?;
+    }
+
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset as u64))
+            .map_err(|_| ExecError::Message("EIO: seek failed"))?;
+    }
+
+    let buf = if size > 0 {
+        let mut buf = vec![0u8; size as usize];
+        file.read_exact(&mut buf)
+            .map_err(|_| ExecError::Message("EIO: file shorter than declared size"))?;
+        buf
+    } else {
+        let mut buf = Vec::new();
+        file.take(MAX_FILE_READ as u64)
+            .read_to_end(&mut buf)
+            .map_err(|_| ExecError::Message("EIO: read failed"))?;
+        buf
+    };
+
+    if buf.is_empty() {
+        return Err(ExecError::Message("ENODATA: file is empty"));
+    }
+
+    // Delete temporary files after reading (Kitty protocol requirement).
+    if medium == Medium::TempFile {
+        let _ = fs::remove_file(&canonical);
+    }
+
+    Ok(buf)
+}
+
+/// Reject paths under sensitive pseudo-filesystems.
+///
+/// Following Ghostty, we block `/proc/`, `/sys/`, and `/dev/` (except
+/// `/dev/shm/` which is a legitimate shared-memory temp location on Linux).
+fn reject_sensitive_path(canonical: &Path) -> Result<(), ExecError> {
+    if canonical.starts_with("/proc") || canonical.starts_with("/sys") {
+        return Err(ExecError::Message("EPERM: access to pseudo-filesystem denied"));
+    }
+
+    if canonical.starts_with("/dev") && !canonical.starts_with("/dev/shm") {
+        return Err(ExecError::Message("EPERM: access to device path denied"));
+    }
+
+    Ok(())
+}
+
+/// Validate that a canonical path resides under a system temp directory.
+///
+/// Accepted directories:
+/// - `std::env::temp_dir()` (and its canonicalized form)
+/// - `/tmp` (always, even on Linux where it differs from `temp_dir`)
+/// - `/dev/shm` (Linux shared memory)
+/// - `/private/tmp` (macOS, where `/tmp` → `/private/tmp`)
+///
+/// For `t=t` the path must also contain the `tty-graphics-protocol` marker
+/// to prevent accidental deletion of unrelated temp files.
+fn validate_temp_path(canonical: &Path) -> Result<(), ExecError> {
+    // Check for the required marker in the file name / path components.
+    if !canonical.to_string_lossy().contains(TEMP_FILE_MARKER) {
+        return Err(ExecError::Message(
+            "EINVAL: temp file path must contain 'tty-graphics-protocol'",
+        ));
+    }
+
+    // Canonical env temp dir (handles /var → /private/var on macOS).
+    let temp_dir = std::env::temp_dir();
+    if let Ok(canonical_temp) = std::fs::canonicalize(&temp_dir) {
+        if canonical.starts_with(&canonical_temp) {
+            return Ok(());
+        }
+    }
+
+    // Direct comparison with the un-canonicalized temp dir.
+    if canonical.starts_with(&temp_dir) {
+        return Ok(());
+    }
+
+    // /tmp is always a valid temp root.
+    if canonical.starts_with("/tmp") {
+        return Ok(());
+    }
+
+    // macOS: /tmp → /private/tmp.
+    #[cfg(target_os = "macos")]
+    if canonical.starts_with("/private/tmp") {
+        return Ok(());
+    }
+
+    // Linux: /dev/shm is used for shared-memory backed temp files.
+    #[cfg(target_os = "linux")]
+    if canonical.starts_with("/dev/shm") {
+        return Ok(());
+    }
+
+    Err(ExecError::Message("EPERM: temporary file not in temp directory"))
 }
 
 fn resolve_image_id(t: &Transmission, storage: &mut ImageStorage) -> (u32, bool) {
@@ -1269,5 +1503,333 @@ mod tests {
         };
         let result = execute(&anonymous, &mut storage, &mut placements, &mut loading, 0, 0);
         assert!(result.response.is_none());
+    }
+
+    // --- File and temp-file medium tests ---
+
+    #[test]
+    fn test_transmit_file_medium() {
+        use std::io::Write;
+        let rgba = rgba_1x1();
+        let dir = std::env::temp_dir();
+        let path = dir.join("alacritty_test_kitty_file.rgba");
+        std::fs::File::create(&path).unwrap().write_all(&rgba).unwrap();
+
+        let mut storage = ImageStorage::new();
+        let mut placements = Vec::new();
+        let mut loading = None;
+        let cmd = Command {
+            action: Action::Transmit,
+            transmission: Transmission {
+                format: Format::Rgba,
+                medium: Medium::File,
+                width: 1,
+                height: 1,
+                image_id: 100,
+                ..Default::default()
+            },
+            data: path.to_string_lossy().into_owned().into_bytes(),
+            ..Default::default()
+        };
+        let result = execute(&cmd, &mut storage, &mut placements, &mut loading, 0, 0);
+        assert!(result.response.is_some());
+        assert!(storage.get_image(100).is_some());
+        // File should still exist (not a temp file).
+        assert!(path.exists());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_transmit_temp_file_deletes_after_read() {
+        use std::io::Write;
+        let rgba = rgba_1x1();
+        let dir = std::env::temp_dir();
+        let path = dir.join("tty-graphics-protocol-test-temp.rgba");
+        std::fs::File::create(&path).unwrap().write_all(&rgba).unwrap();
+
+        let mut storage = ImageStorage::new();
+        let mut placements = Vec::new();
+        let mut loading = None;
+        let cmd = Command {
+            action: Action::Transmit,
+            transmission: Transmission {
+                format: Format::Rgba,
+                medium: Medium::TempFile,
+                width: 1,
+                height: 1,
+                image_id: 101,
+                ..Default::default()
+            },
+            data: path.to_string_lossy().into_owned().into_bytes(),
+            ..Default::default()
+        };
+        let result = execute(&cmd, &mut storage, &mut placements, &mut loading, 0, 0);
+        assert!(result.response.is_some());
+        assert!(storage.get_image(101).is_some());
+        // Temp file must be deleted after reading.
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_temp_file_rejects_non_temp_path() {
+        let path = if cfg!(target_os = "macos") {
+            "/Users/fake/tty-graphics-protocol-image.rgba"
+        } else {
+            "/home/fake/tty-graphics-protocol-image.rgba"
+        };
+        let result = validate_temp_path(std::path::Path::new(path));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_temp_file_rejects_missing_marker() {
+        let dir = std::env::temp_dir();
+        let canonical_temp = std::fs::canonicalize(&dir).unwrap();
+        let path = canonical_temp.join("no-marker-image.rgba");
+        let result = validate_temp_path(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_temp_file_accepts_temp_dir_with_marker() {
+        let dir = std::env::temp_dir();
+        let canonical_temp = std::fs::canonicalize(&dir).unwrap();
+        let path = canonical_temp.join("tty-graphics-protocol-test.rgba");
+        assert!(validate_temp_path(&path).is_ok());
+    }
+
+    #[test]
+    fn test_file_offset_and_size() {
+        use std::io::Write;
+        // Write 8 bytes of RGBA data: 2 pixels.
+        let data = [255u8, 0, 0, 255, 0, 255, 0, 255];
+        let dir = std::env::temp_dir();
+        let path = dir.join("alacritty_test_kitty_offset.rgba");
+        std::fs::File::create(&path).unwrap().write_all(&data).unwrap();
+
+        let mut storage = ImageStorage::new();
+        let mut placements = Vec::new();
+        let mut loading = None;
+        let cmd = Command {
+            action: Action::Transmit,
+            transmission: Transmission {
+                format: Format::Rgba,
+                medium: Medium::File,
+                width: 1,
+                height: 1,
+                image_id: 102,
+                offset: 4,
+                size: 4,
+                ..Default::default()
+            },
+            data: path.to_string_lossy().into_owned().into_bytes(),
+            ..Default::default()
+        };
+        let result = execute(&cmd, &mut storage, &mut placements, &mut loading, 0, 0);
+        assert!(result.response.is_some());
+        let img = storage.get_image(102).unwrap();
+        assert_eq!(&img.data, &[0, 255, 0, 255]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_file_size_exceeds_file_length() {
+        use std::io::Write;
+        let data = [255u8, 0, 0, 255];
+        let dir = std::env::temp_dir();
+        let path = dir.join("alacritty_test_kitty_short.rgba");
+        std::fs::File::create(&path).unwrap().write_all(&data).unwrap();
+
+        let result = read_file_payload(
+            path.to_string_lossy().as_bytes(),
+            Medium::File,
+            0,
+            100, // Much larger than the 4-byte file.
+        );
+        assert!(result.is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_file_rejects_directory() {
+        let dir = std::env::temp_dir();
+        let result = read_file_payload(
+            dir.to_string_lossy().as_bytes(),
+            Medium::File,
+            0,
+            0,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_file_medium_abandons_chunked_load() {
+        use std::io::Write;
+
+        let mut storage = ImageStorage::new();
+        let mut placements = Vec::new();
+        let mut loading = None;
+
+        // Start a chunked direct transmission (more_chunks=true).
+        let chunk1 = Command {
+            action: Action::Transmit,
+            transmission: Transmission {
+                format: Format::Rgba,
+                medium: Medium::Direct,
+                width: 1,
+                height: 1,
+                image_id: 200,
+                more_chunks: true,
+                ..Default::default()
+            },
+            data: vec![255, 0, 0, 255],
+            ..Default::default()
+        };
+        execute(&chunk1, &mut storage, &mut placements, &mut loading, 0, 0);
+        assert!(loading.is_some(), "chunked load should be in progress");
+
+        // A file medium command arrives — should abandon the chunked load.
+        let rgba = rgba_1x1();
+        let dir = std::env::temp_dir();
+        let path = dir.join("alacritty_test_abandon_chunk.rgba");
+        std::fs::File::create(&path).unwrap().write_all(&rgba).unwrap();
+
+        let file_cmd = Command {
+            action: Action::Transmit,
+            transmission: Transmission {
+                format: Format::Rgba,
+                medium: Medium::File,
+                width: 1,
+                height: 1,
+                image_id: 201,
+                ..Default::default()
+            },
+            data: path.to_string_lossy().into_owned().into_bytes(),
+            ..Default::default()
+        };
+        let result = execute(&file_cmd, &mut storage, &mut placements, &mut loading, 0, 0);
+        assert!(result.response.is_some());
+        // The file image should be stored; the chunked load abandoned.
+        assert!(storage.get_image(201).is_some());
+        assert!(loading.is_none(), "loading should be cleared after file medium");
+        // The partial chunked image (200) should NOT be stored.
+        assert!(storage.get_image(200).is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_file_medium_ignores_more_chunks() {
+        use std::io::Write;
+
+        let rgba = rgba_1x1();
+        let dir = std::env::temp_dir();
+        let path = dir.join("alacritty_test_no_chunk.rgba");
+        std::fs::File::create(&path).unwrap().write_all(&rgba).unwrap();
+
+        let mut storage = ImageStorage::new();
+        let mut placements = Vec::new();
+        let mut loading = None;
+
+        // File medium with more_chunks=true should NOT enter chunked mode.
+        let cmd = Command {
+            action: Action::Transmit,
+            transmission: Transmission {
+                format: Format::Rgba,
+                medium: Medium::File,
+                width: 1,
+                height: 1,
+                image_id: 202,
+                more_chunks: true,
+                ..Default::default()
+            },
+            data: path.to_string_lossy().into_owned().into_bytes(),
+            ..Default::default()
+        };
+        let result = execute(&cmd, &mut storage, &mut placements, &mut loading, 0, 0);
+        assert!(result.response.is_some());
+        // Image should be fully loaded (not chunked).
+        assert!(storage.get_image(202).is_some());
+        assert!(loading.is_none(), "file medium should not enter chunked loading");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P2 fix: a chunked `a=T,m=1` followed by a file `a=t` must NOT
+    /// inherit the abandoned T&D's display intent (saved_display).
+    #[test]
+    fn test_file_medium_does_not_inherit_saved_display() {
+        use std::io::Write;
+
+        let mut storage = ImageStorage::new();
+        let mut placements = Vec::new();
+        let mut loading = None;
+
+        // Start a chunked TransmitAndDisplay (a=T, m=1).
+        let first = Command {
+            action: Action::TransmitAndDisplay,
+            transmission: Transmission {
+                format: Format::Rgba,
+                medium: Medium::Direct,
+                width: 1,
+                height: 1,
+                image_id: 300,
+                more_chunks: true,
+                ..Default::default()
+            },
+            data: vec![255, 0, 0, 255],
+            ..Default::default()
+        };
+        execute_transmit(&first, &mut storage, &mut placements, &mut loading, Some((2, 4)));
+        assert!(loading.is_some());
+        assert!(loading.as_ref().unwrap().pending_display.is_some());
+
+        // Now a file-medium Transmit (NOT TransmitAndDisplay) arrives.
+        let rgba = rgba_1x1();
+        let dir = std::env::temp_dir();
+        let path = dir.join("alacritty_test_no_inherit_display.rgba");
+        std::fs::File::create(&path).unwrap().write_all(&rgba).unwrap();
+
+        let file_cmd = Command {
+            action: Action::Transmit,
+            transmission: Transmission {
+                format: Format::Rgba,
+                medium: Medium::File,
+                width: 1,
+                height: 1,
+                image_id: 301,
+                ..Default::default()
+            },
+            data: path.to_string_lossy().into_owned().into_bytes(),
+            ..Default::default()
+        };
+        execute_transmit(&file_cmd, &mut storage, &mut placements, &mut loading, None);
+
+        // The file image (301) should be stored but NOT have a placement
+        // (it was action=Transmit, not TransmitAndDisplay).
+        assert!(storage.get_image(301).is_some());
+        let has_placement_301 = placements.iter().any(|p| p.image_id == 301);
+        assert!(!has_placement_301, "file image should not inherit abandoned T&D placement");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_reject_sensitive_paths() {
+        assert!(reject_sensitive_path(Path::new("/proc/self/environ")).is_err());
+        assert!(reject_sensitive_path(Path::new("/sys/class/net")).is_err());
+        assert!(reject_sensitive_path(Path::new("/dev/urandom")).is_err());
+        // /dev/shm is allowed.
+        assert!(reject_sensitive_path(Path::new("/dev/shm/test")).is_ok());
+        // Normal paths are allowed.
+        assert!(reject_sensitive_path(Path::new("/tmp/test.png")).is_ok());
+    }
+
+    #[test]
+    fn test_size_exceeds_max_file_read() {
+        let result = read_file_payload(
+            b"/tmp/test.png",
+            Medium::File,
+            0,
+            (MAX_FILE_READ + 1) as u32,
+        );
+        assert!(result.is_err());
     }
 }

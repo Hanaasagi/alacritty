@@ -387,6 +387,10 @@ pub struct Display {
     /// Damage tracker for the given display.
     pub damage_tracker: DamageTracker,
 
+    /// Last observed graphics dirty counter. Compared against the current
+    /// value to detect whether image textures need re-uploading.
+    last_graphics_dirty: u64,
+
     /// Font size used by the window.
     pub font_size: FontSize,
 
@@ -561,6 +565,7 @@ impl Display {
             frame_timer: FrameTimer::new(),
             raw_window_handle,
             damage_tracker,
+            last_graphics_dirty: 0,
             glyph_cache,
             hint_state,
             size_info,
@@ -977,21 +982,23 @@ impl Display {
         let metrics = self.glyph_cache.font_metrics();
         let size_info = self.size_info;
 
+        let needs_sync = terminal.graphics_state.dirty() != self.last_graphics_dirty;
         let mut graphics =
-            RenderableGraphics::collect(&terminal, display_offset, &size_info);
+            RenderableGraphics::collect(&terminal, display_offset, &size_info, needs_sync);
 
         // If a previously off-viewport image has become visible again but its GPU
         // texture was evicted, force a re-upload from terminal storage.
-        if !graphics.sync_to_gpu && self.renderer.needs_graphics_reupload(&graphics) {
-            terminal.graphics_state.dirty = true;
-            graphics = RenderableGraphics::collect(&terminal, display_offset, &size_info);
+        if !needs_sync && self.renderer.needs_graphics_reupload(&graphics) {
+            terminal.graphics_state.mark_dirty();
+            graphics =
+                RenderableGraphics::collect(&terminal, display_offset, &size_info, true);
         }
 
-        if graphics.sync_to_gpu {
-            terminal.graphics_state.dirty = false;
-        }
+        // Record the observed dirty counter so subsequent frames without
+        // mutations skip the upload path.
+        self.last_graphics_dirty = graphics.dirty_snapshot;
 
-        if graphics.sync_to_gpu || !graphics.placements.is_empty() {
+        if needs_sync || !graphics.placements.is_empty() {
             self.damage_tracker.frame().mark_fully_damaged();
             self.damage_tracker.next_frame().mark_fully_damaged();
         }

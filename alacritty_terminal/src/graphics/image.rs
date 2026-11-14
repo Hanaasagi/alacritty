@@ -20,6 +20,13 @@ pub struct Image {
     pub image_number: u32,
     /// Whether this image has an implicitly assigned ID.
     pub implicit_id: bool,
+    /// Monotonically increasing stamp set by [`ImageStorage::add_image`].
+    ///
+    /// Identifies a single transmission lifetime: stays constant even when
+    /// animation frames change the displayed content (which only bumps a
+    /// future `generation` field). Used by `get_image_by_number` to pick the
+    /// most recently transmitted image when multiple share the same number.
+    pub transmission_order: u64,
 }
 
 /// A partially-received image (chunked transmission).
@@ -118,6 +125,7 @@ impl LoadingImage {
             data: rgba,
             image_number: self.image_number,
             implicit_id: self.implicit_id,
+            transmission_order: 0,
         })
     }
 }
